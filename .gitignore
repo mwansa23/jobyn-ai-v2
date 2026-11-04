@@ -233,3 +233,12 @@ htmlcov/
 .idea/
 .vercel
 .env*
+
+# Firebase service-account credentials
+*firebase-adminsdk*.json
+
+# Local diagnostic files
+_*.txt
+migration_output.txt
+Activate.ps1)
+openapi-live.json
