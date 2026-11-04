@@ -57,7 +57,7 @@ let token=localStorage.getItem('jobyn_token')||null,userEmail=localStorage.getIt
 const stageOrder=['landing','resume','jobs','matching','career','copilot','applications','interview'];
 
 // HELPERS / API
-const API_BASE='https://jobyn-ai-v2.vercel.app';
+const API_BASE='';
 function esc(s){const d=document.createElement('div');d.textContent=s==null?'':String(s);return d.innerHTML}
 function showMsg(el,type,html){if(!el)return;el.className='msg '+type;el.innerHTML=html}
 function spin(){return '<span style="display:inline-block;width:12px;height:12px;border:2px solid #c8d8d3;border-top-color:#176b5d;border-radius:50%;animation:spin .7s linear infinite;vertical-align:-2px;margin-right:7px"></span>'}
