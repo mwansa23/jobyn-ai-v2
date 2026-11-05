@@ -11,6 +11,7 @@ from backend.api.routes import career
 from backend.api.routes import jobs
 from backend.api.routes import prototype
 from backend.api.routes import resume
+from backend.api.routes import tailoring
 from backend.api.routes import users
 
 api_router = APIRouter(prefix="/api/v1")
@@ -42,3 +43,6 @@ api_router.include_router(applications.router)
 
 # AI Prototype endpoints
 api_router.include_router(prototype.router)
+
+# CV Tailoring Studio endpoints
+api_router.include_router(tailoring.router)

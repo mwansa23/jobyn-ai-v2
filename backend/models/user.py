@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from backend.models.career import CareerInsight
     from backend.models.job import Application, Job, MatchResult
     from backend.models.resume import GeneratedResume, Resume, ResumeDraft, UploadedResume
+    from backend.models.tailoring import TailoringDocument
     from backend.models.user_profile import (
         UserEducation,
         UserExperience,
@@ -104,6 +105,12 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     created_jobs: Mapped[list[Job]] = relationship(back_populates="created_by_user")
     match_results: Mapped[list[MatchResult]] = relationship(back_populates="user")
     applications: Mapped[list[Application]] = relationship(back_populates="user")
+
+    # CV Tailoring Studio documents.
+    tailoring_documents: Mapped[list["TailoringDocument"]] = relationship(  # noqa: F821, UP037
+        back_populates="user",
+        cascade="all, delete-orphan",
+    )
 
     # Career intelligence: persisted AI career analyses.
     career_insights: Mapped[list[CareerInsight]] = relationship(

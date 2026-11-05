@@ -45,6 +45,23 @@ class ParseStatus(StrEnum):
     FAILED = "failed"
 
 
+class DocumentType(StrEnum):
+    """Type of document in the CV Tailoring Studio."""
+
+    CV = "cv"
+    JOB_DESCRIPTION = "job_description"
+
+
+class ExtractionStatus(StrEnum):
+    """Lifecycle of a tailoring document's text extraction."""
+
+    PENDING = "pending"
+    PROCESSING = "processing"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    SCANNED_PDF = "scanned_pdf"
+
+
 class ResumeStatus(StrEnum):
     """Lifecycle of a canonical resume document."""
 

@@ -24,9 +24,11 @@ from backend.models.career import CareerInsight
 from backend.models.enums import (
     ApplicationStatus,
     ComplianceEventType,
+    DocumentType,
     DraftStatus,
     EmploymentType,
     ExperienceLevel,
+    ExtractionStatus,
     GenerationStatus,
     IngestionStatus,
     JobCategory,
@@ -50,6 +52,9 @@ from backend.models.resume import (
     ResumeTemplate,
     UploadedResume,
 )
+from backend.models.tailoring import TailoringDocument
+from backend.models.tailoring_analysis import TailoringAnalysis
+from backend.models.tailored_cv import TailoredCV
 from backend.models.user import User
 from backend.models.user_profile import (
     UserEducation,
@@ -65,9 +70,11 @@ __all__ = [
     "CareerInsight",
     "ComplianceEvent",
     "ComplianceEventType",
+    "DocumentType",
     "DraftStatus",
     "EmploymentType",
     "ExperienceLevel",
+    "ExtractionStatus",
     "GeneratedResume",
     "GenerationStatus",
     "IngestionSource",
@@ -89,6 +96,9 @@ __all__ = [
     "ResumeTemplate",
     "SoftDeleteMixin",
     "SourceType",
+    "TailoredCV",
+    "TailoringAnalysis",
+    "TailoringDocument",
     "TimestampMixin",
     "UUIDPrimaryKeyMixin",
     "UploadedResume",
