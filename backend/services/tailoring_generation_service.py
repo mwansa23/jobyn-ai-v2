@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import logging
 import uuid
+from copy import deepcopy
+from typing import Any
 
 from backend.ai.cv_editor import CVEditorError, CVEditorService
 from backend.ai.cv_rewriter import CVRewriterError, CVRewriterService
@@ -136,7 +138,7 @@ class TailoringGenerationService(BaseService[TailoredCVRepository]):
         self,
         user_id: uuid.UUID,
         edit_request: str,
-    ) -> TailoredCV:
+    ) -> TailoredCV | dict[str, Any]:
         """Apply a conversational edit to the latest tailored CV.
 
         Args:
@@ -171,6 +173,24 @@ class TailoringGenerationService(BaseService[TailoredCVRepository]):
             logger.exception("CV edit failed for user %s", user_id)
             raise TailoringGenerationError(f"CV edit failed: {exc}") from exc
 
+        if edited.get("needs_clarification"):
+            return edited
+
+        explanation_by_index = {
+            entry["section_index"]: entry["explanation"].strip()
+            for entry in edited.pop("section_explanations", [])
+        }
+        edited.pop("needs_clarification", None)
+        edited.pop("clarification_question", None)
+        edited["comparison"] = self.build_comparison(
+            latest.content.get("sections", []),
+            edited.get("sections", []),
+            explanation_by_index,
+            fallback_explanation=(
+                f"Change made in response to: {edit_request.strip()}"
+            ),
+        )
+
         max_version = await self.repository.get_max_version_number(user_id)
         version_number = max_version + 1
 
@@ -187,6 +207,129 @@ class TailoringGenerationService(BaseService[TailoredCVRepository]):
         await self.commit()
 
         return await self.repository.get_by(id=cv_record.id) or cv_record
+
+    @staticmethod
+    def build_comparison(
+        before_sections: list[Any],
+        after_sections: list[Any],
+        explanation_by_index: dict[int, str],
+        *,
+        fallback_explanation: str,
+    ) -> list[dict[str, Any]]:
+        """Describe changes by matching sections, not by their current position."""
+        def identity(section: Any) -> tuple[str, str]:
+            if not isinstance(section, dict):
+                return ("", "")
+            return (
+                str(section.get("heading") or "").strip().casefold(),
+                str(section.get("type") or "").strip().casefold(),
+            )
+
+        before_by_identity: dict[tuple[str, str], list[int]] = {}
+        for index, section in enumerate(before_sections):
+            before_by_identity.setdefault(identity(section), []).append(index)
+
+        after_to_before: dict[int, int] = {}
+        unmatched_after = []
+        matched_before: set[int] = set()
+        for after_index, section in enumerate(after_sections):
+            candidates = before_by_identity.get(identity(section), [])
+            before_index = next(
+                (candidate for candidate in candidates if candidate not in matched_before),
+                None,
+            )
+            if before_index is None:
+                unmatched_after.append(after_index)
+            else:
+                after_to_before[after_index] = before_index
+                matched_before.add(before_index)
+
+        # A renamed heading can still be matched when its section type is unique.
+        for after_index in unmatched_after[:]:
+            after_section = after_sections[after_index]
+            after_type = (
+                str(after_section.get("type") or "").strip().casefold()
+                if isinstance(after_section, dict)
+                else ""
+            )
+            candidates = [
+                index
+                for index, section in enumerate(before_sections)
+                if index not in matched_before
+                and isinstance(section, dict)
+                and str(section.get("type") or "").strip().casefold() == after_type
+            ]
+            remaining_after = [
+                index
+                for index in unmatched_after
+                if isinstance(after_sections[index], dict)
+                and str(after_sections[index].get("type") or "").strip().casefold()
+                == after_type
+            ]
+            if after_type and len(candidates) == 1 and len(remaining_after) == 1:
+                before_index = candidates[0]
+                after_to_before[after_index] = before_index
+                matched_before.add(before_index)
+                unmatched_after.remove(after_index)
+
+        comparison = []
+        for after_index, after in enumerate(after_sections):
+            before_index = after_to_before.get(after_index)
+            before = before_sections[before_index] if before_index is not None else None
+            moved = before_index is not None and before_index != after_index
+            status = (
+                "added" if before is None else
+                "changed" if before != after else
+                "unchanged"
+            )
+            section = after if isinstance(after, dict) else {}
+            entry = {
+                "section_index": after_index,
+                "heading": section.get("heading") or section.get("type") or "Section",
+                "status": status,
+                "before": deepcopy(before),
+                "after": deepcopy(after),
+            }
+            if before_index is not None:
+                entry["before_index"] = before_index
+            if moved:
+                entry["position_changed"] = True
+            if status != "unchanged":
+                entry["explanation"] = (
+                    explanation_by_index.get(after_index)
+                    or (
+                        "Section position changed as part of this edit."
+                        if moved and before == after
+                        else fallback_explanation
+                    )
+                    or "Changed in response to the requested CV edit."
+                )
+            comparison.append(entry)
+
+        for before_index, before in enumerate(before_sections):
+            if before_index in matched_before:
+                continue
+            section = before if isinstance(before, dict) else {}
+            comparison.append(
+                {
+                    "section_index": before_index,
+                    "heading": section.get("heading") or section.get("type") or "Section",
+                    "status": "removed",
+                    "before": deepcopy(before),
+                    "after": None,
+                    "before_index": before_index,
+                    "explanation": fallback_explanation
+                    or "Section removed in response to the requested CV edit.",
+                }
+            )
+
+        comparison.sort(
+            key=lambda entry: (
+                entry.get("before_index", entry["section_index"]),
+                entry["section_index"],
+            )
+        )
+        return comparison
 
     async def get_latest_for_user(self, user_id: uuid.UUID) -> TailoredCV | None:
         """Return the user's most recent tailored CV version."""
@@ -275,13 +418,14 @@ class TailoringGenerationService(BaseService[TailoredCVRepository]):
 
         max_version = await self.repository.get_max_version_number(user_id)
         new_version = max_version + 1
+        reverted_content = deepcopy(target.content)
 
         cv_record = await self.repository.create(
             user_id=user_id,
             analysis_id=target.analysis_id,
             version_number=new_version,
             status="pending",
-            content=target.content,
+            content=reverted_content,
             edit_type="revert",
             edit_request=f"Revert to version {version_number}",
             change_summary=f"Reverted to version {version_number}.",

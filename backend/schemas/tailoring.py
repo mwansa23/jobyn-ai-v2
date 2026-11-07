@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -160,6 +160,13 @@ class EditCVRequest(BaseModel):
     message: str = Field(min_length=1, max_length=5000, description="Edit request")
 
 
+class EditCVClarification(BaseModel):
+    """Clarification requested before creating a new CV version."""
+
+    needs_clarification: Literal[True] = True
+    clarification_question: str
+
+
 class SetCVStatusRequest(BaseModel):
     """Request body for accepting or rejecting a CV version."""
 
@@ -185,6 +192,7 @@ __all__ = [
     "TailoredCVListResponse",
     "GenerateCVRequest",
     "EditCVRequest",
+    "EditCVClarification",
     "SetCVStatusRequest",
     "RevertCVRequest",
 ]

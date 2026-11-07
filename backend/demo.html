@@ -167,6 +167,9 @@ main{max-width:1160px;width:100%;margin:0 auto;padding:clamp(26px,5vw,64px) clam
     <!-- Change summary -->
     <div id="tailor-cv-change-summary" class="hide" style="padding:10px 14px;border-radius:12px;background:#f0f5f3;font-size:12px;color:#3f6960;margin-bottom:16px"></div>
 
+    <!-- Exact before/after comparison for proposed edits -->
+    <div id="tailor-cv-comparison" class="hide" style="margin-bottom:18px"></div>
+
     <!-- The A4-style document preview -->
     <div id="tailor-cv-preview" class="cv-preview"></div>
 
@@ -181,6 +184,12 @@ main{max-width:1160px;width:100%;margin:0 auto;padding:clamp(26px,5vw,64px) clam
     <div id="tailor-cv-versions" class="hide" style="margin-top:16px;padding:14px;border:1px solid var(--line);border-radius:14px;background:#fafaf8">
       <div class="label">Version History</div>
       <div id="tailor-cv-versions-list" style="margin-top:8px"></div>
+      <div id="tailor-cv-history-preview" class="hide" style="margin-top:16px;padding-top:14px;border-top:1px solid var(--line)">
+        <div id="tailor-cv-history-preview-title" class="eyebrow"></div>
+        <div id="tailor-cv-history-comparison" style="margin-bottom:14px"></div>
+        <div id="tailor-cv-history-content" class="cv-preview"></div>
+        <button id="tailor-cv-history-restore" class="btn small" style="margin-top:14px" onclick="restoreSelectedCVVersion()">Restore this version</button>
+      </div>
     </div>
   </div>
 
@@ -377,7 +386,9 @@ async function tailorChatSend() {
   const typingId = _chatTyping();
 
   // Route the message
-  if (_looksLikeJD(text)) {
+  if (pendingCVEdit) {
+    await _handleFollowUpMessage(text, typingId);
+  } else if (_looksLikeJD(text)) {
     await _handleJDMessage(text, typingId);
   } else {
     await _handleFollowUpMessage(text, typingId);
@@ -417,8 +428,13 @@ async function _handleJDMessage(text, typingId) {
 async function _handleFollowUpMessage(text, typingId) {
   const t = text.toLowerCase();
 
+  if (pendingCVEdit) {
+    await handleCVEditRequest(text, typingId);
+    return;
+  }
+
   // Route: CV edit requests (rewrite, improve, shorten, emphasise, undo) — only if a tailored CV exists
-  if (tailoredCVId && /rewrite|improve|shorten|emphas|emphasi|make.*(relevant|concise|ats)|incorporat|undo|revert|reorganis|reorganiz|add.*(achievement|responsibilit|skill|experience)|strengthen|polish|refine/.test(t)) {
+  if (tailoredCVId && /edit|update|change|rewrite|improve|shorten|emphas|emphasi|make.*(relevant|concise|ats)|incorporat|undo|revert|reorganis|reorganiz|add.*(achievement|responsibilit|skill|experience)|strengthen|polish|refine/.test(t)) {
     await handleCVEditRequest(text, typingId);
     return;
   }
@@ -735,6 +751,8 @@ function proceedToTailor() {
 let tailoredCVId = null;
 let tailoredCVVersion = 0;
 let tailoredCVStatus = 'pending';
+let pendingCVEdit = null;
+let selectedHistoryCV = null;
 
 // ── Generate Tailored CV ─────────────────────────────────────────
 async function generateTailoredCV() {
@@ -788,11 +806,67 @@ function _applyTailoredCV(cvData) {
     }
   }
   // Render the CV preview
+  renderCVComparison(cvData.content?.comparison || []);
   renderCVPreview(cvData.content);
 }
 
-function renderCVPreview(content) {
-  const el = document.getElementById('tailor-cv-preview');
+function _comparisonSectionText(section) {
+  if (!section) return '<span class="tiny">Section not present in this version.</span>';
+  const parts = [];
+  if (section.content) parts.push(String(section.content));
+  for (const item of section.items || []) {
+    if (typeof item === 'string') parts.push('• ' + item);
+    else if (item && typeof item === 'object') parts.push(JSON.stringify(item, null, 2));
+  }
+  return parts.length ? esc(parts.join('\n')) : '<span class="tiny">(No section content)</span>';
+}
+
+function renderCVComparison(
+  comparison,
+  targetId = 'tailor-cv-comparison',
+  headingText = 'Review changes',
+  beforeLabel = 'Before',
+  afterLabel = 'After',
+  introText = 'Compare the saved version with this proposal before accepting or rejecting it.'
+) {
+  const el = document.getElementById(targetId);
+  if (!el) return;
+  const entries = Array.isArray(comparison) ? comparison : [];
+  if (!entries.length) {
+    el.innerHTML = '';
+    el.classList.add('hide');
+    return;
+  }
+  const changed = entries.filter(entry => entry.status !== 'unchanged');
+  el.classList.remove('hide');
+  el.innerHTML = `<div class="card" style="margin-bottom:0"><div class="eyebrow">${esc(headingText)}</div>` +
+    (changed.length
+      ? `<p class="muted" style="font-size:12px;margin-bottom:14px">${changed.length} section${changed.length === 1 ? '' : 's'} changed. ${esc(introText)}</p>`
+      : '<p class="muted" style="font-size:12px;margin-bottom:14px">No section content changed.</p>') +
+    entries.map(entry => {
+      const heading = esc(entry.heading || 'Section');
+      const moved = entry.position_changed === true && entry.status === 'unchanged';
+      if (entry.status === 'unchanged' && !moved) {
+        return `<div style="padding:10px 0;border-top:1px solid var(--line);font-size:12px"><strong>${heading}</strong> <span class="tiny">Unchanged</span></div>`;
+      }
+      const status = moved
+        ? 'Reordered'
+        : entry.status === 'added'
+          ? 'Added'
+          : entry.status === 'removed'
+            ? 'Removed'
+            : 'Changed';
+      return `<div style="padding:14px 0;border-top:1px solid var(--line)"><strong>${heading} · ${status}</strong>` +
+        `<div class="grid-2" style="gap:10px;margin-top:10px">` +
+        `<div><div class="label">${esc(beforeLabel)}</div><div class="prose" style="white-space:pre-wrap">${_comparisonSectionText(entry.before)}</div></div>` +
+        `<div><div class="label">${esc(afterLabel)}</div><div class="prose" style="white-space:pre-wrap">${_comparisonSectionText(entry.after)}</div></div></div>` +
+        (entry.explanation ? `<p class="tiny" style="margin-top:10px"><strong>Why this change:</strong> ${esc(entry.explanation)}</p>` : '') +
+        '</div>';
+    }).join('') + '</div>';
+}
+
+function renderCVPreview(content, targetId = 'tailor-cv-preview') {
+  const el = document.getElementById(targetId);
   if (!el || !content) return;
   const sections = content.sections || [];
   let html = '';
@@ -845,7 +919,10 @@ async function handleCVEditRequest(editText, typingId) {
     return;
   }
   _chatAppend('jobyn', spin() + ' Applying your edit to the CV…');
-  const r = await api('/api/v1/tailoring/cv/edit', 'POST', { message: editText });
+  const message = pendingCVEdit
+    ? `Original edit request: ${pendingCVEdit.request}\nCandidate clarification: ${[...pendingCVEdit.answers, editText].join('\n')}`
+    : editText;
+  const r = await api('/api/v1/tailoring/cv/edit', 'POST', { message });
   // Remove the "Applying…" message
   const thread = document.getElementById('tailor-chat-thread');
   if (thread && thread.lastElementChild) {
@@ -858,6 +935,17 @@ async function handleCVEditRequest(editText, typingId) {
     );
     return;
   }
+  if (r.data?.needs_clarification) {
+    pendingCVEdit = {
+      request: pendingCVEdit?.request || editText,
+      answers: [...(pendingCVEdit?.answers || []), editText],
+    };
+    _chatAppend('jobyn',
+      `${esc(r.data.clarification_question || 'Please provide the missing information before I update your CV.')}`
+    );
+    return;
+  }
+  pendingCVEdit = null;
   _applyTailoredCV(r.data);
   _chatAppend('jobyn',
     `<strong>CV updated — version ${r.data.version_number}.</strong><br>` +
@@ -902,14 +990,63 @@ async function revertCVVersionPrompt() {
 }
 
 async function revertCVVersion(versionNum) {
+  const confirmed = window.confirm(
+    `Restore saved CV version ${versionNum} as a new version? Your existing versions will be preserved.`
+  );
+  if (!confirmed) return;
   const r = await api('/api/v1/tailoring/cv/revert', 'POST', { version_number: versionNum });
   if (r.ok) {
     _applyTailoredCV(r.data);
-    _chatAppend('jobyn', `Reverted to version ${versionNum}. New version ${r.data.version_number} created. Review below.`);
+    selectedHistoryCV = null;
+    document.getElementById('tailor-cv-history-preview')?.classList.add('hide');
+    await showCVVersions();
+    _chatAppend('jobyn', `Restored version ${versionNum} as new version ${r.data.version_number}. Earlier versions remain in history.`);
     document.getElementById('tailor-cv-preview-section')?.scrollIntoView({behavior:'smooth'});
   } else {
     _chatAppend('jobyn', `<span style="color:var(--danger)">Could not revert: ${esc(r.data?.detail || 'error')}</span>`);
   }
+}
+
+async function previewCVVersion(cvId) {
+  const panel = document.getElementById('tailor-cv-history-preview');
+  const title = document.getElementById('tailor-cv-history-preview-title');
+  const content = document.getElementById('tailor-cv-history-content');
+  const comparison = document.getElementById('tailor-cv-history-comparison');
+  if (!panel || !title || !content || !comparison) return;
+  selectedHistoryCV = null;
+  const restoreButton = document.getElementById('tailor-cv-history-restore');
+  if (restoreButton) restoreButton.disabled = true;
+  panel.classList.remove('hide');
+  title.textContent = 'Loading saved version…';
+  content.innerHTML = spin();
+  comparison.innerHTML = '';
+  const r = await api(`/api/v1/tailoring/cv/${cvId}`);
+  if (!r.ok) {
+    title.textContent = 'Could not load this saved version.';
+    content.innerHTML = '';
+    return;
+  }
+  selectedHistoryCV = r.data;
+  title.textContent = `Selected historical version v${r.data.version_number} · current version v${tailoredCVVersion}`;
+  renderCVComparison(
+    r.data.content?.comparison || [],
+    'tailor-cv-history-comparison',
+    `Version ${r.data.version_number} compared with current v${tailoredCVVersion}`,
+    `Current v${tailoredCVVersion}`,
+    `Selected v${r.data.version_number}`,
+    'The preview is read-only. Restore creates a new version and keeps all saved versions.'
+  );
+  renderCVPreview(r.data.content, 'tailor-cv-history-content');
+  if (restoreButton) {
+    const isCurrent = r.data.version_number === tailoredCVVersion;
+    restoreButton.disabled = isCurrent;
+    restoreButton.textContent = isCurrent ? 'This is the current version' : 'Restore this version';
+  }
+}
+
+async function restoreSelectedCVVersion() {
+  if (!selectedHistoryCV) return;
+  await revertCVVersion(selectedHistoryCV.version_number);
 }
 
 async function showCVVersions() {
@@ -924,6 +1061,9 @@ async function showCVVersions() {
     return;
   }
   const versions = r.data.items || [];
+  if (selectedHistoryCV && !versions.some(v => v.id === selectedHistoryCV.id)) {
+    selectedHistoryCV = null;
+  }
   if (!versions.length) {
     listEl.innerHTML = '<span class="tiny">No versions yet.</span>';
     return;
@@ -933,10 +1073,11 @@ async function showCVVersions() {
     return `<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--line)">
       <div><strong>v${v.version_number}</strong> <span class="tiny">${esc(v.edit_type)}</span>
       ${v.change_summary ? '<br><span class="tiny">' + esc(v.change_summary.slice(0,100)) + '</span>' : ''}
+      ${v.version_number === tailoredCVVersion ? '<br><span class="tiny" style="color:var(--accent)">Current version</span>' : ''}
       </div>
       <div style="display:flex;gap:6px;align-items:center">
         <span style="font-size:11px;font-weight:700;color:${statusColor}">${esc(v.status)}</span>
-        ${v.version_number !== tailoredCVVersion ? `<button class="btn secondary small" onclick="revertCVVersion(${v.version_number})">Revert</button>` : '<span class="tiny" style="color:var(--accent)">current</span>'}
+        <button class="btn secondary small" onclick="previewCVVersion('${v.id}')">${selectedHistoryCV?.id === v.id ? 'Selected' : 'Preview'}</button>
       </div>
     </div>`;
   }).join('');

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import uuid
+from copy import deepcopy
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -235,6 +236,56 @@ class TestGetTailoredCV:
         r = client.get(TAILORED_LATEST_URL, headers=_auth_header(token))
         assert r.status_code == 404
 
+    def test_preview_historical_version_is_read_only_and_compared(
+        self, client: TestClient
+    ) -> None:
+        token = _register_and_login(client)
+        _setup_full_pipeline(client, token)
+        with patch(_PATCH_REWRITER, new=AsyncMock(return_value=_MOCK_REWRITTEN_CV)):
+            initial = client.post(
+                GENERATE_URL, headers=_auth_header(token), json={}
+            ).json()
+        with patch(_PATCH_EDITOR, new=AsyncMock(return_value=_MOCK_EDITED_CV)):
+            client.post(
+                EDIT_URL,
+                headers=_auth_header(token),
+                json={"message": "Emphasise microservices"},
+            )
+
+        preview = client.get(
+            f"/api/v1/tailoring/cv/{initial['id']}", headers=_auth_header(token)
+        )
+        assert preview.status_code == 200
+        data = preview.json()
+        assert data["version_number"] == 1
+        assert data["content"]["sections"] == _MOCK_REWRITTEN_CV["sections"]
+        comparison = {
+            entry["heading"]: entry for entry in data["content"]["comparison"]
+        }
+        assert comparison["Professional Summary"]["status"] == "changed"
+        assert comparison["Professional Summary"]["before"] == (
+            _MOCK_EDITED_CV["sections"][1]
+        )
+        assert comparison["Professional Summary"]["after"] == (
+            _MOCK_REWRITTEN_CV["sections"][1]
+        )
+        assert comparison["Education"]["status"] == "unchanged"
+
+        latest = client.get(TAILORED_LATEST_URL, headers=_auth_header(token)).json()
+        versions = client.get(VERSIONS_URL, headers=_auth_header(token)).json()
+        assert latest["version_number"] == 2
+        assert versions["total"] == 2
+
+    def test_preview_requires_authentication(self, client: TestClient) -> None:
+        token = _register_and_login(client)
+        _setup_full_pipeline(client, token)
+        with patch(_PATCH_REWRITER, new=AsyncMock(return_value=_MOCK_REWRITTEN_CV)):
+            cv = client.post(
+                GENERATE_URL, headers=_auth_header(token), json={}
+            ).json()
+        response = client.get(f"/api/v1/tailoring/cv/{cv['id']}")
+        assert response.status_code in (401, 403)
+
     def test_cross_user_access_blocked(self, client: TestClient) -> None:
         token1 = _register_and_login(client)
         _setup_full_pipeline(client, token1)
@@ -249,6 +300,146 @@ class TestGetTailoredCV:
 
 class TestConversationalEdit:
     """Tests for POST /tailoring/cv/edit."""
+
+    def test_section_edit_preserves_unrelated_sections(self, client: TestClient) -> None:
+        token = _register_and_login(client)
+        _setup_full_pipeline(client, token)
+        with patch(_PATCH_REWRITER, new=AsyncMock(return_value=_MOCK_REWRITTEN_CV)):
+            client.post(GENERATE_URL, headers=_auth_header(token), json={})
+
+        model_response = deepcopy(_MOCK_EDITED_CV)
+        model_response["sections"][3]["items"].append("Unrequested skill")
+        model_response["sections"][4]["items"] = ["Changed education"]
+        model_response["section_explanations"] = [
+            {
+                "section_index": 1,
+                "explanation": "The request asked to target the platform engineering role.",
+            }
+        ]
+        editor = AsyncMock(return_value=model_response)
+        with patch("backend.ai.cv_editor.generate_json", new=editor):
+            response = client.post(
+                EDIT_URL,
+                headers=_auth_header(token),
+                json={"message": "Rewrite my summary for a platform engineering role"},
+            )
+
+        assert response.status_code == 201, response.text
+        sections = response.json()["content"]["sections"]
+        assert sections[1]["content"] == model_response["sections"][1]["content"]
+        assert sections[3] == _MOCK_REWRITTEN_CV["sections"][3]
+        assert sections[4] == _MOCK_REWRITTEN_CV["sections"][4]
+        comparison = response.json()["content"]["comparison"]
+        assert comparison[1]["status"] == "changed"
+        assert comparison[1]["before"] == _MOCK_REWRITTEN_CV["sections"][1]
+        assert comparison[1]["after"] == sections[1]
+        assert comparison[1]["explanation"] == (
+            "The request asked to target the platform engineering role."
+        )
+        assert all(
+            comparison[index]["status"] == "unchanged"
+            for index in (0, 2, 3, 4)
+        )
+        prompt = editor.await_args.args[0]
+        assert "Only section index 1" in prompt
+
+    def test_edit_clarification_does_not_create_version(self, client: TestClient) -> None:
+        token = _register_and_login(client)
+        _setup_full_pipeline(client, token)
+        with patch(_PATCH_REWRITER, new=AsyncMock(return_value=_MOCK_REWRITTEN_CV)):
+            client.post(GENERATE_URL, headers=_auth_header(token), json={})
+
+        clarification = {
+            "sections": [],
+            "edit_summary": "",
+            "needs_clarification": True,
+            "clarification_question": "How many years of Kubernetes experience do you have?",
+        }
+        with patch(
+            "backend.ai.cv_editor.generate_json",
+            new=AsyncMock(return_value=clarification),
+        ):
+            response = client.post(
+                EDIT_URL,
+                headers=_auth_header(token),
+                json={"message": "Add my Kubernetes experience to the skills section"},
+            )
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {
+            "needs_clarification": True,
+            "clarification_question": clarification["clarification_question"],
+        }
+        versions = client.get(VERSIONS_URL, headers=_auth_header(token)).json()
+        assert versions["total"] == 1
+        assert versions["items"][0]["version_number"] == 1
+
+    def test_unscoped_request_keeps_whole_cv_edit_compatibility(
+        self, client: TestClient
+    ) -> None:
+        token = _register_and_login(client)
+        _setup_full_pipeline(client, token)
+        with patch(_PATCH_REWRITER, new=AsyncMock(return_value=_MOCK_REWRITTEN_CV)):
+            client.post(GENERATE_URL, headers=_auth_header(token), json={})
+
+        model_response = deepcopy(_MOCK_EDITED_CV)
+        model_response["sections"] = [
+            model_response["sections"][0],
+            model_response["sections"][2],
+            model_response["sections"][1],
+            model_response["sections"][3],
+            model_response["sections"][4],
+        ]
+        model_response["section_explanations"] = [
+            {
+                "section_index": 2,
+                "explanation": "This follows the request to emphasize the existing experience.",
+            },
+            {
+                "section_index": 3,
+                "explanation": "Microservices is supported by the existing experience entry.",
+            },
+        ]
+        editor = AsyncMock(return_value=model_response)
+        with patch("backend.ai.cv_editor.generate_json", new=editor):
+            response = client.post(
+                EDIT_URL,
+                headers=_auth_header(token),
+                json={"message": "Emphasise my microservices experience"},
+            )
+
+        assert response.status_code == 201, response.text
+        sections = response.json()["content"]["sections"]
+        assert sections[2]["content"] == _MOCK_EDITED_CV["sections"][1]["content"]
+        assert sections[3]["items"] == _MOCK_EDITED_CV["sections"][3]["items"]
+        comparison = response.json()["content"]["comparison"]
+        assert [entry["status"] for entry in comparison] == [
+            "unchanged",
+            "changed",
+            "unchanged",
+            "changed",
+            "unchanged",
+        ]
+        comparison_by_heading = {entry["heading"]: entry for entry in comparison}
+        assert comparison_by_heading["Professional Summary"]["before"] == (
+            _MOCK_REWRITTEN_CV["sections"][1]
+        )
+        assert comparison_by_heading["Professional Summary"]["after"] == sections[2]
+        assert comparison_by_heading["Professional Summary"]["explanation"] == (
+            "This follows the request to emphasize the existing experience."
+        )
+        assert comparison_by_heading["Experience"]["before"] == (
+            _MOCK_REWRITTEN_CV["sections"][2]
+        )
+        assert comparison_by_heading["Experience"]["after"] == sections[1]
+        assert comparison_by_heading["Experience"]["status"] == "unchanged"
+        assert comparison_by_heading["Experience"]["position_changed"] is True
+        assert "explanation" not in comparison_by_heading["Experience"]
+
+        assert comparison_by_heading["Skills"]["explanation"] == (
+            "Microservices is supported by the existing experience entry."
+        )
+        assert "Only section index" not in editor.await_args.args[0]
 
     def test_edit_creates_new_version(self, client: TestClient) -> None:
         token = _register_and_login(client)
@@ -348,13 +539,27 @@ class TestRevert:
             client.post(EDIT_URL, headers=_auth_header(token),
                         json={"message": "Add microservices"})
 
-        r = client.post(REVERT_URL, headers=_auth_header(token),
-                        json={"version_number": 1})
+        editor = AsyncMock()
+        with patch(_PATCH_EDITOR, new=editor):
+            r = client.post(REVERT_URL, headers=_auth_header(token),
+                            json={"version_number": 1})
         assert r.status_code == 201, r.text
         data = r.json()
         assert data["version_number"] == 3
         assert data["edit_type"] == "revert"
         assert data["change_summary"] == "Reverted to version 1."
+        assert data["content"]["sections"] == _MOCK_REWRITTEN_CV["sections"]
+        assert data["content"]["generation_notes"] == _MOCK_REWRITTEN_CV["generation_notes"]
+        editor.assert_not_awaited()
+        comparison = data["content"]["comparison"]
+        assert comparison[1]["status"] == "changed"
+        assert comparison[1]["before"] == _MOCK_EDITED_CV["sections"][1]
+        assert comparison[1]["after"] == _MOCK_REWRITTEN_CV["sections"][1]
+        assert comparison[1]["explanation"] == "Restored from version 1."
+        versions = client.get(VERSIONS_URL, headers=_auth_header(token)).json()
+        assert versions["total"] == 3
+        initial = next(item for item in versions["items"] if item["version_number"] == 1)
+        assert initial["content"] == _MOCK_REWRITTEN_CV
 
     def test_revert_nonexistent_version(self, client: TestClient) -> None:
         token = _register_and_login(client)

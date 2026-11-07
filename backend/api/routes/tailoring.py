@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import logging
 import uuid
+from copy import deepcopy
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, HTTPException, Response, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.api.deps import get_current_user, get_session
@@ -389,6 +390,7 @@ from backend.ai.cv_rewriter import CVRewriterError, CVRewriterService  # noqa: E
 from backend.models.tailored_cv import TailoredCV  # noqa: E402
 from backend.repositories.tailored_cv import TailoredCVRepository  # noqa: E402
 from backend.schemas.tailoring import (  # noqa: E402
+    EditCVClarification,
     EditCVRequest,
     GenerateCVRequest,
     RevertCVRequest,
@@ -463,28 +465,32 @@ async def get_latest_tailored_cv(
 
 @router.post(
     "/cv/edit",
-    response_model=TailoredCVRead,
-    status_code=status.HTTP_201_CREATED,
+    response_model=TailoredCVRead | EditCVClarification,
     summary="Apply a conversational edit to the tailored CV",
 )
 async def edit_tailored_cv(
     payload: EditCVRequest,
+    response: Response,
     current_user: User = Depends(get_current_user),
     service: TailoringGenerationService = Depends(_get_generation_service),
-) -> TailoredCVRead:
+) -> TailoredCVRead | EditCVClarification:
     """Apply a natural-language edit request to the latest tailored CV.
 
     Creates a new version with the updated content. Previous versions are preserved.
     """
     try:
-        cv = await service.apply_edit(current_user.id, payload.message)
+        result = await service.apply_edit(current_user.id, payload.message)
     except TailoringGenerationError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=str(exc),
         ) from exc
 
-    return TailoredCVRead.model_validate(cv)
+    if isinstance(result, dict):
+        return EditCVClarification.model_validate(result)
+
+    response.status_code = status.HTTP_201_CREATED
+    return TailoredCVRead.model_validate(result)
 
 
 @router.get(
@@ -525,7 +531,21 @@ async def get_tailored_cv(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Tailored CV not found.",
         )
-    return TailoredCVRead.model_validate(cv)
+    response_data = TailoredCVRead.model_validate(cv)
+    latest = await service.get_latest_for_user(current_user.id)
+    response_data.content = deepcopy(response_data.content)
+    response_data.content["comparison"] = service.build_comparison(
+        latest.content.get("sections", []) if latest else [],
+        response_data.content.get("sections", []),
+        {},
+        fallback_explanation=(
+            f"Previewing version {cv.version_number} against current version "
+            f"{latest.version_number}."
+            if latest
+            else "Previewing the saved CV version."
+        ),
+    )
+    return response_data
 
 
 @router.patch(
@@ -572,6 +592,7 @@ async def revert_cv(
     This effectively undoes later changes. The original versions remain preserved.
     """
     try:
+        previous = await service.get_latest_for_user(current_user.id)
         cv = await service.revert_to_version(current_user.id, payload.version_number)
     except TailoringGenerationError as exc:
         raise HTTPException(
@@ -579,7 +600,15 @@ async def revert_cv(
             detail=str(exc),
         ) from exc
 
-    return TailoredCVRead.model_validate(cv)
+    response_data = TailoredCVRead.model_validate(cv)
+    response_data.content = deepcopy(response_data.content)
+    response_data.content["comparison"] = service.build_comparison(
+        previous.content.get("sections", []) if previous else [],
+        response_data.content.get("sections", []),
+        {},
+        fallback_explanation=f"Restored from version {payload.version_number}.",
+    )
+    return response_data
 
 
 @router.get(
