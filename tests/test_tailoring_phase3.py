@@ -539,6 +539,11 @@ class TestRevert:
             client.post(EDIT_URL, headers=_auth_header(token),
                         json={"message": "Add microservices"})
 
+        versions_before_revert = client.get(VERSIONS_URL, headers=_auth_header(token)).json()
+        assert versions_before_revert["total"] == 2
+        original_version = next(item for item in versions_before_revert["items"] if item["version_number"] == 1)
+        assert original_version["content"] == _MOCK_REWRITTEN_CV
+
         editor = AsyncMock()
         with patch(_PATCH_EDITOR, new=editor):
             r = client.post(REVERT_URL, headers=_auth_header(token),
@@ -548,6 +553,8 @@ class TestRevert:
         assert data["version_number"] == 3
         assert data["edit_type"] == "revert"
         assert data["change_summary"] == "Reverted to version 1."
+        assert data["content"]["sections"] == original_version["content"]["sections"]
+        assert data["content"]["generation_notes"] == original_version["content"]["generation_notes"]
         assert data["content"]["sections"] == _MOCK_REWRITTEN_CV["sections"]
         assert data["content"]["generation_notes"] == _MOCK_REWRITTEN_CV["generation_notes"]
         editor.assert_not_awaited()
@@ -556,10 +563,13 @@ class TestRevert:
         assert comparison[1]["before"] == _MOCK_EDITED_CV["sections"][1]
         assert comparison[1]["after"] == _MOCK_REWRITTEN_CV["sections"][1]
         assert comparison[1]["explanation"] == "Restored from version 1."
-        versions = client.get(VERSIONS_URL, headers=_auth_header(token)).json()
-        assert versions["total"] == 3
-        initial = next(item for item in versions["items"] if item["version_number"] == 1)
-        assert initial["content"] == _MOCK_REWRITTEN_CV
+        versions_after_revert = client.get(VERSIONS_URL, headers=_auth_header(token)).json()
+        assert versions_after_revert["total"] == 3
+        reverted_version = next(item for item in versions_after_revert["items"] if item["version_number"] == 1)
+        assert reverted_version["content"] == _MOCK_REWRITTEN_CV
+        assert reverted_version["content"] == original_version["content"]
+        assert reverted_version["version_number"] == 1
+        assert reverted_version["content"]["sections"] == _MOCK_REWRITTEN_CV["sections"]
 
     def test_revert_nonexistent_version(self, client: TestClient) -> None:
         token = _register_and_login(client)
