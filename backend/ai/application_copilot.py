@@ -19,6 +19,8 @@ import json
 import logging
 from typing import Any
 
+from backend.ai.tabitoken_client import TaBiTokenClient
+
 logger = logging.getLogger(__name__)
 
 
@@ -96,6 +98,9 @@ class ApplicationCopilotService:
     This class deliberately has no database/repository dependencies.
     """
 
+    def __init__(self, cover_letter_client: TaBiTokenClient | None = None) -> None:
+        self._cover_letter_client = cover_letter_client
+
     async def generate(
         self,
         *,
@@ -107,8 +112,7 @@ class ApplicationCopilotService:
         """
         Generate the structured application package.
 
-        Replace the AI call in this method with your actual NVIDIA NIM /
-        LLM implementation if it is already available elsewhere.
+        Cover-letter generation uses the configured TaBiAI/Claude provider.
         """
 
         try:
@@ -151,22 +155,6 @@ class ApplicationCopilotService:
             application_tips
         """
 
-        # ---------------------------------------------------------
-        # TEMPORARY SAFE FALLBACK
-        # ---------------------------------------------------------
-        #
-        # If your existing NVIDIA/LLM implementation already exists,
-        # replace ONLY this fallback with that implementation.
-        #
-        # The rest of the application pipeline expects this shape.
-        # ---------------------------------------------------------
-
-        candidate_name = (
-            candidate_profile.get("name")
-            or candidate_profile.get("full_name")
-            or "the candidate"
-        )
-
         job_title = job_details.get("title") or "the position"
         company = job_details.get("company") or "your organisation"
 
@@ -180,38 +168,56 @@ class ApplicationCopilotService:
                 if skill.strip() not in all_skills:
                     all_skills.append(skill.strip())
 
-        skill_text = ", ".join(all_skills[:8])
+        job_description = str(job_details.get("description") or "").strip()
+        matched_requirements = [
+            skill
+            for skill in all_skills
+            if skill.casefold() in job_description.casefold()
+        ][:8]
+        career_strengths = career_context or {}
+        raw_strengths = career_strengths.get("strengths", [])
+        if not isinstance(raw_strengths, list):
+            raw_strengths = []
+        key_selling_points = [
+            str(point).strip()
+            for point in raw_strengths
+            if isinstance(point, str) and point.strip()
+        ][:8]
+        key_selling_points.extend(
+            skill for skill in all_skills if skill not in key_selling_points
+        )
+        key_selling_points = key_selling_points[:8]
+
+        cover_letter_client = self._cover_letter_client or TaBiTokenClient()
+        cover_letter = await cover_letter_client.generate_cover_letter(
+            resume=json.dumps(candidate_profile, ensure_ascii=False, indent=2),
+            job_title=job_title,
+            company=company,
+            job_description=job_description,
+            key_selling_points=key_selling_points,
+            matched_requirements=matched_requirements,
+            addressed_skill_gaps=[],
+            additional_context=additional_context,
+        )
+        if not cover_letter.strip():
+            raise ApplicationCopilotError(
+                "The cover-letter provider returned an empty letter."
+            )
 
         return {
-            "cover_letter": (
-                f"Dear Hiring Manager,\n\n"
-                f"I am writing to express my interest in the {job_title} "
-                f"position at {company}. My background and experience align "
-                f"well with the requirements of the role. "
-                f"I would welcome the opportunity to contribute my skills "
-                f"and experience to your organisation.\n\n"
-                f"My technical background includes {skill_text or 'relevant professional skills'}. "
-                f"I am confident that my experience, problem-solving ability, "
-                f"and commitment to delivering high-quality work would enable "
-                f"me to make a meaningful contribution.\n\n"
-                f"Thank you for considering my application. I would welcome "
-                f"the opportunity to discuss my suitability for the position.\n\n"
-                f"Yours sincerely,\n"
-                f"{candidate_name}"
-            ),
+            "cover_letter": cover_letter,
             "key_selling_points": [
-                f"Relevant experience for the {job_title} position",
-                *all_skills[:3],
+                *key_selling_points,
             ],
             "matched_requirements": [
                 {
                     "requirement": skill,
                     "evidence": (
-                        f"{skill} is listed in the candidate's professional "
-                        f"profile."
+                        f"{skill} appears in both the candidate profile and "
+                        "the job description."
                     ),
                 }
-                for skill in all_skills[:3]
+                for skill in matched_requirements[:3]
             ],
             "addressed_skill_gaps": [],
             "application_tips": [
