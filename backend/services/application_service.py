@@ -13,10 +13,9 @@ The ``ApplicationStatus`` enum defines:
     draft → applied → under_review → interviewing → offered
                                                   ↘ rejected
     Any status → withdrawn  (candidate-initiated exit)
-    rejected and offered are terminal — no further transitions.
 
-These rules reflect the real-world hiring pipeline and prevent nonsensical
-backwards transitions. They live here, not in routes.
+Candidates self-report their application stage, so the status update endpoint
+allows corrections and direct updates between these lifecycle states.
 
 Transaction ownership
 ---------------------
@@ -43,31 +42,10 @@ logger = logging.getLogger(__name__)
 # Status transition map                                                #
 # ------------------------------------------------------------------ #
 
-# Maps each status to the set of statuses it may legally transition to.
+# Candidates may update their self-reported status to any other lifecycle state.
 _ALLOWED_TRANSITIONS: dict[ApplicationStatus, frozenset[ApplicationStatus]] = {
-    ApplicationStatus.DRAFT: frozenset({
-        ApplicationStatus.APPLIED,
-        ApplicationStatus.WITHDRAWN,
-    }),
-    ApplicationStatus.APPLIED: frozenset({
-        ApplicationStatus.UNDER_REVIEW,
-        ApplicationStatus.REJECTED,
-        ApplicationStatus.WITHDRAWN,
-    }),
-    ApplicationStatus.UNDER_REVIEW: frozenset({
-        ApplicationStatus.INTERVIEWING,
-        ApplicationStatus.REJECTED,
-        ApplicationStatus.WITHDRAWN,
-    }),
-    ApplicationStatus.INTERVIEWING: frozenset({
-        ApplicationStatus.OFFERED,
-        ApplicationStatus.REJECTED,
-        ApplicationStatus.WITHDRAWN,
-    }),
-    # Terminal statuses — no further transitions allowed.
-    ApplicationStatus.OFFERED: frozenset(),
-    ApplicationStatus.REJECTED: frozenset(),
-    ApplicationStatus.WITHDRAWN: frozenset(),
+    current: frozenset(candidate for candidate in ApplicationStatus if candidate != current)
+    for current in ApplicationStatus
 }
 
 _INITIAL_ALLOWED = frozenset({ApplicationStatus.DRAFT, ApplicationStatus.APPLIED})
@@ -205,6 +183,42 @@ class ApplicationService(BaseService[ApplicationRepository]):
             )
 
         return application
+
+    async def apply_to_job(
+        self,
+        user_id: uuid.UUID,
+        job_id: uuid.UUID,
+    ) -> Application:
+        """Create or advance the user's tracked application to applied."""
+        job = await self.job_repository.get_by_id(job_id)
+        if job is None:
+            raise JobNotFoundError(f"Job {job_id} not found.")
+
+        existing = await self.application_repository.get_existing_application(
+            user_id, job_id
+        )
+        if existing is None:
+            return await self.create_application(
+                user_id,
+                job_id,
+                status_str=ApplicationStatus.APPLIED.value,
+            )
+        if existing.status != ApplicationStatus.APPLIED:
+            return await self.update_application(
+                user_id,
+                existing.id,
+                status_str=ApplicationStatus.APPLIED.value,
+            )
+        if (
+            existing.status == ApplicationStatus.APPLIED
+            and existing.applied_at is None
+        ):
+            return await self.update_application(
+                user_id,
+                existing.id,
+                applied_at=date.today(),
+            )
+        return existing
 
     async def get_application(
         self,

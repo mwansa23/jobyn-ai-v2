@@ -11,6 +11,7 @@ from __future__ import annotations
 import uuid
 
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 
 from backend.models.enums import ApplicationStatus
 from backend.models.job import Application
@@ -37,7 +38,7 @@ class ApplicationRepository(BaseRepository[Application]):
         stmt = select(Application).where(
             Application.id == application_id,
             Application.user_id == user_id,
-        )
+        ).options(selectinload(Application.job))
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none()
 
@@ -80,6 +81,7 @@ class ApplicationRepository(BaseRepository[Application]):
         """
         stmt = (
             select(Application)
+            .options(selectinload(Application.job))
             .where(Application.user_id == user_id)
         )
         if status is not None:

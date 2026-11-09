@@ -13,7 +13,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from backend.schemas.common import ORMModel, PaginatedResponse
 
@@ -68,6 +68,10 @@ class JobRead(ORMModel):
     is_active: bool
     source: str
     external_url: str | None
+    apply_url: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("apply_url", "external_url"),
+    )
     created_at: datetime
 
     # ORM field name: posted_at  →  API/OpenAPI name: date_posted

@@ -125,6 +125,32 @@ async def create_application(
     return ApplicationRead.model_validate(application)
 
 
+@router.post(
+    "/{job_id}/apply",
+    response_model=ApplicationRead,
+    summary="Mark a job as applied",
+)
+async def apply_to_job(
+    job_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    service: ApplicationService = Depends(_get_application_service),
+) -> ApplicationRead:
+    """Create or advance the current user's application to applied."""
+    try:
+        application = await service.apply_to_job(current_user.id, job_id)
+    except JobNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+    except (InvalidStatusError, InvalidTransitionError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+    return ApplicationRead.model_validate(application)
+
+
 # ------------------------------------------------------------------ #
 # List                                                                 #
 # ------------------------------------------------------------------ #
@@ -166,7 +192,15 @@ async def list_applications(
         ) from exc
 
     return PaginatedResponse(
-        items=[ApplicationRead.model_validate(a) for a in applications],
+        items=[
+            ApplicationRead.model_validate(a).model_copy(
+                update={
+                    "job_title": a.job.title,
+                    "employer": a.job.company_name,
+                }
+            )
+            for a in applications
+        ],
         total=total,
         offset=offset,
         limit=limit,

@@ -14,7 +14,7 @@ from __future__ import annotations
 import uuid
 from datetime import date, datetime
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from backend.schemas.common import ORMModel, PaginatedResponse
 
@@ -85,11 +85,17 @@ class ApplicationRead(ORMModel):
     status: str
     cover_letter: str | None
     applied_at: date | None
+    application_date: date | None = Field(
+        default=None,
+        validation_alias=AliasChoices("application_date", "applied_at"),
+    )
     last_activity_at: date | None
     notes: str | None
     resume_version: int | None
     created_at: datetime
     updated_at: datetime
+    job_title: str | None = None
+    employer: str | None = None
 
 
 # ------------------------------------------------------------------ #
