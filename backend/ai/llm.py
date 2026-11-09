@@ -66,20 +66,10 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 # NVIDIA NIM provider configuration
 # ============================================================================
-# Read directly from environment (historical behaviour retained).
-
-NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
-
-NVIDIA_BASE_URL = os.getenv(
-    "NVIDIA_BASE_URL",
-    "https://integrate.api.nvidia.com/v1",
-).rstrip("/")
-
-# IMPORTANT: Do not use the retired GLM model as a fallback.
-NVIDIA_MODEL = os.getenv(
-    "NVIDIA_MODEL",
-    "nvidia/nemotron-3.5-lightning-30b-a3b",
-)
+_settings = get_settings()
+NVIDIA_API_KEY = _settings.NVIDIA_API_KEY
+NVIDIA_BASE_URL = _settings.NVIDIA_BASE_URL.rstrip("/")
+NVIDIA_MODEL = _settings.NVIDIA_MODEL
 
 DEFAULT_ENABLE_THINKING = (
     os.getenv("NVIDIA_ENABLE_THINKING", "false").strip().lower()

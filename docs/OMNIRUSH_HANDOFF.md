@@ -170,7 +170,7 @@ The 24 Phase 1–3 files are:
 
 ### AI services and provider abstraction
 
-All AI services call `generate_json()` or `generate_text()` from `backend/ai/llm.py`. The active provider is selected by `LLM_PROVIDER` env var:
+All AI services, including cover-letter generation, call `generate_json()` or `generate_text()` from `backend/ai/llm.py`. The active provider is selected by `LLM_PROVIDER` env var:
 - `nvidia` (default) — NVIDIA NIM, uses `NVIDIA_API_KEY`, `NVIDIA_BASE_URL`, `NVIDIA_MODEL`
 - `freellmapi` — self-hosted router, uses `FREELLMAPI_BASE_URL`, `FREELLMAPI_API_KEY`
 

@@ -187,12 +187,24 @@ def create_app() -> FastAPI:
     async def llm_health() -> dict[str, Any]:
         """Return the configured LLM provider and model."""
 
-        from backend.ai.llm import NVIDIA_API_KEY, NVIDIA_MODEL
+        from backend.ai.llm import get_llm_config
 
+        config = get_llm_config()
+        if config["active_provider"] == "freellmapi":
+            configured = bool(
+                config["freellmapi_api_key_configured"]
+                and config["freellmapi_base_url"]
+            )
+            model = config["freellmapi_model"]
+            provider = "freellmapi"
+        else:
+            configured = bool(config["api_key_configured"])
+            model = config["model"]
+            provider = config["provider"]
         return {
-            "llm_configured": bool(NVIDIA_API_KEY),
-            "provider": "nvidia_nim",
-            "model": NVIDIA_MODEL,
+            "llm_configured": configured,
+            "provider": provider,
+            "model": model,
         }
 
     return app

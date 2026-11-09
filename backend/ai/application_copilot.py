@@ -19,7 +19,7 @@ import json
 import logging
 from typing import Any
 
-from backend.ai.tabitoken_client import TaBiTokenClient
+from backend.ai.llm import generate_text
 
 logger = logging.getLogger(__name__)
 
@@ -98,9 +98,6 @@ class ApplicationCopilotService:
     This class deliberately has no database/repository dependencies.
     """
 
-    def __init__(self, cover_letter_client: TaBiTokenClient | None = None) -> None:
-        self._cover_letter_client = cover_letter_client
-
     async def generate(
         self,
         *,
@@ -112,7 +109,8 @@ class ApplicationCopilotService:
         """
         Generate the structured application package.
 
-        Cover-letter generation uses the configured TaBiAI/Claude provider.
+        Cover-letter generation uses the configured provider via the shared
+        LLM client.
         """
 
         try:
@@ -188,16 +186,34 @@ class ApplicationCopilotService:
         )
         key_selling_points = key_selling_points[:8]
 
-        cover_letter_client = self._cover_letter_client or TaBiTokenClient()
-        cover_letter = await cover_letter_client.generate_cover_letter(
-            resume=json.dumps(candidate_profile, ensure_ascii=False, indent=2),
-            job_title=job_title,
-            company=company,
-            job_description=job_description,
-            key_selling_points=key_selling_points,
-            matched_requirements=matched_requirements,
-            addressed_skill_gaps=[],
-            additional_context=additional_context,
+        prompt = (
+            "Write a concise, professional cover letter tailored to this role.\n\n"
+            f"Job title: {job_title}\n"
+            f"Company: {company}\n\n"
+            "Job description:\n"
+            f"{job_description or 'Not provided.'}\n\n"
+            "Candidate resume/profile (use as the sole source of candidate facts):\n"
+            f"{json.dumps(candidate_profile, ensure_ascii=False, indent=2)}\n\n"
+            "Matched skills supported by the profile and job description:\n"
+            f"{json.dumps(matched_requirements, ensure_ascii=False)}\n\n"
+            "Candidate strengths:\n"
+            f"{json.dumps(key_selling_points, ensure_ascii=False)}\n\n"
+            "Career context:\n"
+            f"{json.dumps(career_context or {}, ensure_ascii=False, indent=2)}\n\n"
+            "Additional candidate-provided context:\n"
+            f"{additional_context or 'None provided.'}"
+        )
+        cover_letter = await generate_text(
+            prompt,
+            system_prompt=(
+                "You write truthful, specific job application cover letters. "
+                "Use only facts present in the candidate profile or supplied "
+                "context. Never invent qualifications, employers, dates, "
+                "skills, achievements, or metrics. Return only the cover "
+                "letter text, without a title or markdown."
+            ),
+            temperature=0.4,
+            max_tokens=1500,
         )
         if not cover_letter.strip():
             raise ApplicationCopilotError(
