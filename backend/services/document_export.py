@@ -18,6 +18,7 @@ Format:
 
 from __future__ import annotations
 
+from html import escape
 import io
 import logging
 from typing import Any
@@ -270,4 +271,49 @@ def generate_pdf(cv_content: dict[str, Any]) -> bytes:
         raise DocumentExportError(f"Failed to generate PDF: {exc}") from exc
 
 
-__all__ = ["generate_docx", "generate_pdf", "DocumentExportError"]
+def generate_cover_letter_pdf(cover_letter: str) -> bytes:
+    """Generate an A4 PDF from plain-text cover-letter content."""
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import cm
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
+
+    try:
+        buf = io.BytesIO()
+        doc = SimpleDocTemplate(
+            buf,
+            pagesize=A4,
+            topMargin=2 * cm,
+            bottomMargin=2 * cm,
+            leftMargin=2.5 * cm,
+            rightMargin=2.5 * cm,
+        )
+        body_style = ParagraphStyle(
+            "CoverLetterBody",
+            parent=getSampleStyleSheet()["Normal"],
+            fontName="Helvetica",
+            fontSize=11,
+            leading=16,
+            spaceAfter=8,
+        )
+        story = []
+        for paragraph in cover_letter.splitlines():
+            if paragraph.strip():
+                story.append(Paragraph(escape(paragraph), body_style))
+            else:
+                story.append(Spacer(1, 8))
+        doc.build(story)
+        return buf.getvalue()
+    except Exception as exc:
+        logger.exception("Cover-letter PDF generation failed")
+        raise DocumentExportError(
+            f"Failed to generate cover-letter PDF: {exc}"
+        ) from exc
+
+
+__all__ = [
+    "generate_docx",
+    "generate_pdf",
+    "generate_cover_letter_pdf",
+    "DocumentExportError",
+]

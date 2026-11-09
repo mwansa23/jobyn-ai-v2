@@ -11,7 +11,16 @@ import logging
 import uuid
 from copy import deepcopy
 
-from fastapi import APIRouter, Depends, HTTPException, Response, UploadFile, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Response,
+    UploadFile,
+    status,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.api.deps import get_current_user, get_session
@@ -23,6 +32,12 @@ from backend.schemas.tailoring import (
     JobDescriptionPasteRequest,
     TailoringDocumentListResponse,
     TailoringDocumentRead,
+)
+from backend.services.application_package import (
+    MAX_SUPPORTING_DOCUMENT_BYTES,
+    ApplicationPackageError,
+    PackageType,
+    create_application_package,
 )
 from backend.services.tailoring_service import TailoringService, TailoringUploadError
 
@@ -715,4 +730,57 @@ async def export_pdf(
         content=pdf_bytes,
         media_type="application/pdf",
         headers={"Content-Disposition": f"attachment; filename=tailored_cv_v{cv.version_number}.pdf"},
+    )
+
+
+@router.post(
+    "/application-package/export",
+    summary="Generate and download an application PDF package",
+)
+async def export_application_package(
+    package_type: PackageType = Form(...),
+    cover_letter: str | None = Form(default=None),
+    supporting_documents: list[UploadFile] | None = File(default=None),
+    current_user: User = Depends(get_current_user),
+    service: TailoringGenerationService = Depends(_get_generation_service),
+) -> Response:
+    """Create a cover-letter/CV PDF package with optional supporting PDFs."""
+    uploaded_documents: list[tuple[str, bytes]] = []
+    for upload in supporting_documents or []:
+        filename = _safe_filename(upload.filename or "supporting-document.pdf")
+        content = await upload.read(MAX_SUPPORTING_DOCUMENT_BYTES + 1)
+        if len(content) > MAX_SUPPORTING_DOCUMENT_BYTES:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=f"'{filename}' exceeds the 10 MB per-file limit.",
+            )
+        uploaded_documents.append((filename, content))
+
+    cv_content = None
+    if package_type != "cover_letter_only":
+        cv = await service.get_latest_for_user(current_user.id)
+        if cv is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No tailored CV found. Generate one first.",
+            )
+        cv_content = cv.content
+
+    try:
+        pdf_bytes, filename = create_application_package(
+            package_type=package_type,
+            cover_letter=cover_letter,
+            cv_content=cv_content,
+            supporting_documents=uploaded_documents,
+        )
+    except ApplicationPackageError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
