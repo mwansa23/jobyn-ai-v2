@@ -394,6 +394,7 @@ from backend.schemas.tailoring import (  # noqa: E402
     EditCVRequest,
     GenerateCVRequest,
     RevertCVRequest,
+    SaveCVContentRequest,
     SetCVStatusRequest,
     TailoredCVListResponse,
     TailoredCVRead,
@@ -546,6 +547,38 @@ async def get_tailored_cv(
         ),
     )
     return response_data
+
+
+@router.post(
+    "/cv/{cv_id}/visual-edit",
+    response_model=TailoredCVRead,
+    status_code=status.HTTP_201_CREATED,
+    summary="Save visual edits as a new tailored CV version",
+)
+async def save_visual_cv_edit(
+    cv_id: uuid.UUID,
+    payload: SaveCVContentRequest,
+    current_user: User = Depends(get_current_user),
+    service: TailoringGenerationService = Depends(_get_generation_service),
+) -> TailoredCVRead:
+    """Persist candidate-edited CV sections without an AI rewrite."""
+    try:
+        cv = await service.save_visual_edit(
+            current_user.id,
+            cv_id,
+            [section.model_dump() for section in payload.sections],
+        )
+    except TailoringGenerationError as exc:
+        message = str(exc)
+        code = (
+            status.HTTP_404_NOT_FOUND
+            if message == "Tailored CV not found."
+            else status.HTTP_409_CONFLICT
+            if message.startswith("This CV version is no longer current.")
+            else status.HTTP_422_UNPROCESSABLE_ENTITY
+        )
+        raise HTTPException(status_code=code, detail=message) from exc
+    return TailoredCVRead.model_validate(cv)
 
 
 @router.patch(

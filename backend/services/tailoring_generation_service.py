@@ -208,6 +208,50 @@ class TailoringGenerationService(BaseService[TailoredCVRepository]):
 
         return await self.repository.get_by(id=cv_record.id) or cv_record
 
+    async def save_visual_edit(
+        self,
+        user_id: uuid.UUID,
+        cv_id: uuid.UUID,
+        sections: list[dict[str, Any]],
+    ) -> TailoredCV:
+        """Save candidate-edited sections as a new version of the latest CV."""
+        current = await self.repository.get_owned_by_id(cv_id, user_id)
+        if current is None:
+            raise TailoringGenerationError("Tailored CV not found.")
+
+        latest = await self.repository.get_latest_for_user(user_id)
+        if latest is None or latest.id != current.id:
+            raise TailoringGenerationError(
+                "This CV version is no longer current. Reload the latest version before editing."
+            )
+
+        before_sections = current.content.get("sections", [])
+        if before_sections == sections:
+            raise TailoringGenerationError("No changes were made to the CV.")
+
+        content = deepcopy(current.content)
+        content["sections"] = deepcopy(sections)
+        content["comparison"] = self.build_comparison(
+            before_sections,
+            sections,
+            {},
+            fallback_explanation="Edited directly by the candidate.",
+        )
+
+        version_number = await self.repository.get_max_version_number(user_id) + 1
+        cv_record = await self.repository.create(
+            user_id=user_id,
+            analysis_id=current.analysis_id,
+            version_number=version_number,
+            status="pending",
+            content=content,
+            edit_type="visual_edit",
+            edit_request="Edited in the visual CV editor.",
+            change_summary="Updated directly in the visual editor.",
+        )
+        await self.commit()
+        return await self.repository.get_by(id=cv_record.id) or cv_record
+
     @staticmethod
     def build_comparison(
         before_sections: list[Any],

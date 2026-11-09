@@ -159,6 +159,7 @@ main{max-width:1160px;width:100%;margin:0 auto;padding:clamp(26px,5vw,64px) clam
       </div>
       <div style="display:flex;gap:8px;flex-wrap:wrap">
         <button class="btn secondary small" onclick="showCVVersions()">Version history</button>
+        <button class="btn secondary small" id="tailor-cv-edit-toggle" onclick="toggleCVVisualEditor()">Edit visually</button>
         <button class="btn secondary small" onclick="downloadDocx()">DOCX ↓</button>
         <button class="btn secondary small" onclick="downloadPdf()">PDF ↓</button>
       </div>
@@ -169,6 +170,8 @@ main{max-width:1160px;width:100%;margin:0 auto;padding:clamp(26px,5vw,64px) clam
 
     <!-- Exact before/after comparison for proposed edits -->
     <div id="tailor-cv-comparison" class="hide" style="margin-bottom:18px"></div>
+
+    <div id="tailor-cv-editor" class="hide" style="margin-bottom:18px"></div>
 
     <!-- The A4-style document preview -->
     <div id="tailor-cv-preview" class="cv-preview"></div>
@@ -210,6 +213,7 @@ const stageOrder=['landing','resume','jobs','matching','career','tailoring','cop
 // HELPERS / API
 const API_BASE='';
 function esc(s){const d=document.createElement('div');d.textContent=s==null?'':String(s);return d.innerHTML}
+function escAttr(s){return esc(s).replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
 function showMsg(el,type,html){if(!el)return;el.className='msg '+type;el.innerHTML=html}
 function spin(){return '<span style="display:inline-block;width:12px;height:12px;border:2px solid #c8d8d3;border-top-color:#176b5d;border-radius:50%;animation:spin .7s linear infinite;vertical-align:-2px;margin-right:7px"></span>'}
 function tags(arr,cls=''){return (arr||[]).map(t=>`<span class="pill ${cls}">${esc(t)}</span>`).join('')}
@@ -753,6 +757,8 @@ let tailoredCVVersion = 0;
 let tailoredCVStatus = 'pending';
 let pendingCVEdit = null;
 let selectedHistoryCV = null;
+let tailoredCVContent = null;
+let visualCVEditing = false;
 
 // ── Generate Tailored CV ─────────────────────────────────────────
 async function generateTailoredCV() {
@@ -784,6 +790,12 @@ function _applyTailoredCV(cvData) {
   tailoredCVId = cvData.id;
   tailoredCVVersion = cvData.version_number;
   tailoredCVStatus = cvData.status;
+  tailoredCVContent = JSON.parse(JSON.stringify(cvData.content));
+  visualCVEditing = false;
+  document.getElementById('tailor-cv-editor')?.classList.add('hide');
+  document.getElementById('tailor-cv-preview')?.classList.remove('hide');
+  const editToggle = document.getElementById('tailor-cv-edit-toggle');
+  if (editToggle) editToggle.textContent = 'Edit visually';
   document.getElementById('tailor-cv-preview-section')?.classList.remove('hide');
   // Version badge
   const badge = document.getElementById('tailor-cv-version-badge');
@@ -909,6 +921,127 @@ function renderCVPreview(content, targetId = 'tailor-cv-preview') {
     html += '</div>';
   }
   el.innerHTML = html || '<div class="muted">No CV content available.</div>';
+}
+
+function _editableItemKeys(item) {
+  const title = ['title', 'role', 'name'].find(key => Object.prototype.hasOwnProperty.call(item, key));
+  const subtitle = ['company', 'organisation', 'organization', 'institution'].find(key => Object.prototype.hasOwnProperty.call(item, key));
+  const details = ['details', 'description', 'bullets'].find(key => Object.prototype.hasOwnProperty.call(item, key));
+  return { title, subtitle, details };
+}
+
+function _renderEditableItem(item, sectionIndex, itemIndex) {
+  const attrs = `data-section-index="${sectionIndex}" data-item-index="${itemIndex}"`;
+  if (typeof item === 'string') {
+    return `<div class="field"><label>Item ${itemIndex + 1}</label><textarea ${attrs} data-item-field="text" rows="2">${esc(item)}</textarea></div>`;
+  }
+  if (!item || typeof item !== 'object' || Array.isArray(item)) {
+    return `<div class="field"><label>Item ${itemIndex + 1} (JSON)</label><textarea ${attrs} data-item-field="json" rows="3">${esc(JSON.stringify(item))}</textarea></div>`;
+  }
+  const keys = _editableItemKeys(item);
+  const details = keys.details ? item[keys.details] : null;
+  const simpleDetails = details == null || typeof details === 'string' ||
+    (Array.isArray(details) && details.every(value => typeof value === 'string'));
+  if ((!keys.title && !keys.subtitle && !keys.details) || !simpleDetails) {
+    return `<div class="field"><label>Item ${itemIndex + 1} (JSON)</label><textarea ${attrs} data-item-field="json" rows="4">${esc(JSON.stringify(item, null, 2))}</textarea></div>`;
+  }
+  let html = `<div style="padding:12px;border:1px solid var(--line);border-radius:12px;margin-bottom:10px"><div class="label">Item ${itemIndex + 1}</div>`;
+  if (keys.title) html += `<div class="field"><label>Title</label><input ${attrs} data-item-field="title" value="${escAttr(item[keys.title])}"></div>`;
+  if (keys.subtitle) html += `<div class="field"><label>Organisation</label><input ${attrs} data-item-field="subtitle" value="${escAttr(item[keys.subtitle])}"></div>`;
+  if (keys.details) {
+    const text = Array.isArray(details) ? details.join('\n') : details;
+    html += `<div class="field"><label>Details (one per line)</label><textarea ${attrs} data-item-field="details" rows="4">${esc(text)}</textarea></div>`;
+  }
+  return html + '</div>';
+}
+
+function toggleCVVisualEditor() {
+  if (!tailoredCVContent) return;
+  visualCVEditing = !visualCVEditing;
+  const editor = document.getElementById('tailor-cv-editor');
+  const preview = document.getElementById('tailor-cv-preview');
+  const comparison = document.getElementById('tailor-cv-comparison');
+  const toggle = document.getElementById('tailor-cv-edit-toggle');
+  if (toggle) toggle.textContent = visualCVEditing ? 'Cancel visual edit' : 'Edit visually';
+  preview?.classList.toggle('hide', visualCVEditing);
+  if (visualCVEditing) comparison?.classList.add('hide');
+  else renderCVComparison(tailoredCVContent.comparison || []);
+  if (!editor) return;
+  if (!visualCVEditing) {
+    editor.classList.add('hide');
+    editor.innerHTML = '';
+    return;
+  }
+  const sections = tailoredCVContent.sections || [];
+  editor.innerHTML = `<div class="card"><div class="eyebrow">Visual CV editor</div>` +
+    `<p class="muted" style="font-size:12px;margin-bottom:16px">Edit section text directly. Saving creates a new version; earlier versions stay in your history.</p>` +
+    `<div id="tailor-cv-editor-msg"></div>` +
+    sections.map((section, sectionIndex) =>
+      `<div style="padding:14px 0;border-top:1px solid var(--line)"><div class="label">Section ${sectionIndex + 1}</div>` +
+      `<div class="field"><label>Heading</label><input data-section-index="${sectionIndex}" data-section-field="heading" value="${escAttr(section.heading || '')}"></div>` +
+      `<div class="field"><label>Section text</label><textarea data-section-index="${sectionIndex}" data-section-field="content" rows="4">${esc(section.content || '')}</textarea></div>` +
+      (section.items || []).map((item, itemIndex) => _renderEditableItem(item, sectionIndex, itemIndex)).join('') +
+      '</div>'
+    ).join('') +
+    `<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:16px"><button class="btn small" id="tailor-cv-editor-save" onclick="saveVisualCVEdit()">Save as new version</button>` +
+    `<button class="btn secondary small" onclick="toggleCVVisualEditor()">Cancel</button></div></div>`;
+  editor.classList.remove('hide');
+}
+
+async function saveVisualCVEdit() {
+  if (!tailoredCVId || !tailoredCVContent) return;
+  const sections = JSON.parse(JSON.stringify(tailoredCVContent.sections || []));
+  const editor = document.getElementById('tailor-cv-editor');
+  const message = document.getElementById('tailor-cv-editor-msg');
+  const button = document.getElementById('tailor-cv-editor-save');
+  for (const field of editor.querySelectorAll('[data-section-field]')) {
+    const section = sections[Number(field.dataset.sectionIndex)];
+    section[field.dataset.sectionField] = field.value;
+  }
+  for (const field of editor.querySelectorAll('[data-item-field]')) {
+    const sectionIndex = Number(field.dataset.sectionIndex);
+    const itemIndex = Number(field.dataset.itemIndex);
+    const item = sections[sectionIndex].items[itemIndex];
+    if (field.dataset.itemField === 'text') {
+      sections[sectionIndex].items[itemIndex] = field.value;
+    } else if (field.dataset.itemField === 'json') {
+      try {
+        sections[sectionIndex].items[itemIndex] = JSON.parse(field.value);
+      } catch {
+        showMsg(message, 'err', `Item ${itemIndex + 1} in section ${sectionIndex + 1} must contain valid JSON.`);
+        field.focus();
+        return;
+      }
+    } else {
+      const keys = _editableItemKeys(item);
+      const key = field.dataset.itemField === 'title' ? keys.title
+        : field.dataset.itemField === 'subtitle' ? keys.subtitle : keys.details;
+      if (key) {
+        item[key] = field.dataset.itemField === 'details' && Array.isArray(item[key])
+          ? field.value.split(/\r?\n/).map(value => value.trim()).filter(Boolean)
+          : field.value;
+      }
+    }
+  }
+  for (let index = 0; index < sections.length; index++) {
+    if (JSON.stringify(sections[index]) !== JSON.stringify(tailoredCVContent.sections[index])) {
+      sections[index].source = 'candidate_confirmed';
+    }
+  }
+  if (JSON.stringify(sections) === JSON.stringify(tailoredCVContent.sections)) {
+    showMsg(message, 'info', 'No changes to save.');
+    return;
+  }
+  button.disabled = true;
+  showMsg(message, 'info', spin() + 'Saving your new CV version…');
+  const r = await api(`/api/v1/tailoring/cv/${tailoredCVId}/visual-edit`, 'POST', { sections });
+  button.disabled = false;
+  if (!r.ok) {
+    showMsg(message, 'err', esc(r.data?.detail || 'Could not save your CV changes.'));
+    return;
+  }
+  _applyTailoredCV(r.data);
+  _chatAppend('jobyn', `<strong>Visual edits saved as version ${r.data.version_number}.</strong> Your previous version remains in history.`);
 }
 
 // ── Conversational CV editing ────────────────────────────────────

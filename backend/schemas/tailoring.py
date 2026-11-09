@@ -115,10 +115,10 @@ class ChatResponse(BaseModel):
 class TailoredCVSection(BaseModel):
     """A single section of a tailored CV."""
 
-    heading: str = ""
+    heading: str = Field(default="", max_length=300)
     type: str = "other"
-    content: str = ""
-    items: list[Any] = []
+    content: str = Field(default="", max_length=50000)
+    items: list[Any] = Field(default_factory=list, max_length=500)
     source: str = "rewritten"
 
 
@@ -160,6 +160,12 @@ class EditCVRequest(BaseModel):
     message: str = Field(min_length=1, max_length=5000, description="Edit request")
 
 
+class SaveCVContentRequest(BaseModel):
+    """Request body for saving direct visual edits as a new CV version."""
+
+    sections: list[TailoredCVSection] = Field(min_length=1, max_length=50)
+
+
 class EditCVClarification(BaseModel):
     """Clarification requested before creating a new CV version."""
 
@@ -192,6 +198,7 @@ __all__ = [
     "TailoredCVListResponse",
     "GenerateCVRequest",
     "EditCVRequest",
+    "SaveCVContentRequest",
     "EditCVClarification",
     "SetCVStatusRequest",
     "RevertCVRequest",

@@ -26,17 +26,17 @@ Jobyn AI is a career intelligence platform that transforms a candidate's CV into
 - CV rewriting engine: produces a complete tailored CV as structured JSON (sections with heading, type, content, items, source)
 - Conversational editing: natural-language edit requests create new versions (previous versions preserved)
 - Version management: accept/reject/revert with full revision history
+- Visual CV editor: edit section headings, text, and items directly; each save creates a compared, recoverable version
 - DOCX export via `python-docx` (A4, Calibri, professional formatting)
 - PDF export via `reportlab` (A4, Helvetica, ATS-friendly)
-- Frontend: CV preview, version badge, status badge, download buttons, version history
+- Frontend: CV preview, visual editor, version badge, status badge, download buttons, version history
 - 27 tests + 5 E2E tests = 32 tests
 
 **Total: 68 tests, all passing.**
 
 ### Incomplete features
 
-- Phase 4 (conversational editing quality improvements) — not started
-- Visual CV editor — not implemented
+- Further conversational editing quality improvements — partially implemented; automated retries/fallback prompts remain
 - Original CV formatting preservation — not implemented
 - Real-provider AI quality testing — all tests use mocked AI responses
 - Browser-level (Playwright/Selenium) testing — not implemented
@@ -136,6 +136,7 @@ The 24 Phase 1–3 files are:
 - `POST /cv/generate` — generate tailored CV (Phase 3)
 - `GET /cv/tailored/latest` — latest tailored CV version
 - `POST /cv/edit` — conversational edit (creates new version)
+- `POST /cv/{cv_id}/visual-edit` — save direct CV edits as a new version
 - `GET /cv/versions` — version history
 - `GET /cv/{cv_id}` — specific CV version (ownership-checked)
 - `PATCH /cv/{cv_id}/status` — accept/reject
