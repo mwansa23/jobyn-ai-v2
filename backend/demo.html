@@ -70,6 +70,7 @@ main{max-width:1160px;width:100%;margin:0 auto;padding:clamp(26px,5vw,64px) clam
 <section id="tab-career" class="section"><div class="section-head"><div><div class="eyebrow">04 · Career Intelligence</div><h2>Your next career move, mapped by AI.</h2></div><p>Turn your current profile into a strategic path with real roles, skills, certifications and actions.</p></div><div class="card"><div class="grid-2"><div class="field" style="margin:0"><label>Target role <span class="tiny">(optional)</span></label><input type="text" id="career-role" placeholder="e.g. Senior Backend Engineer"></div><div style="display:flex;align-items:flex-end"><button class="btn" onclick="analyseCareer()">Build my career roadmap →</button></div></div><div id="career-msg" style="margin-top:16px"></div></div><div id="career-result"></div><div class="next-bar"><p>Have a target role? Tailor a real application next.</p><button class="btn" onclick="showTab('tailoring')">Tailor your CV →</button></div></section>
 <section id="tab-tailoring" class="section">
   <div class="section-head"><div><div class="eyebrow">04.5 · CV Tailoring Studio</div><h2>Tailor your CV to the role.</h2></div><p>Upload your CV and provide a job description — by file or directly in the chat composer — so Jobyn can analyse the fit and craft a targeted application.</p></div>
+  <div id="tailor-restore-status" class="hide" style="margin-bottom:16px"></div>
 
   <!-- Two-column layout: left=CV upload, right=chat + JD options -->
   <div class="grid-2" style="align-items:start;gap:20px;margin-bottom:20px">
@@ -231,7 +232,7 @@ function updateJourney(){const idx=stageOrder.indexOf(currentStage);document.que
 
 // AUTH
 window.addEventListener('DOMContentLoaded',()=>{if(token)initApp()});
-function initApp(){document.getElementById('login-screen').classList.add('hide');document.getElementById('main-app').classList.remove('hide');showTab('landing');loadJobs();loadApplications()}
+function initApp(){document.getElementById('login-screen').classList.add('hide');document.getElementById('main-app').classList.remove('hide');showTab('landing');loadJobs();loadApplications();restoreTailoringSession()}
 function showRegister(){document.getElementById('register-box').classList.toggle('hide')}
 async function doLogin(){const email=document.getElementById('login-email').value.trim(),password=document.getElementById('login-password').value,msg=document.getElementById('login-msg');if(!email||!password){showMsg(msg,'err','Please enter your email and password.');return}showMsg(msg,'info',spin()+'Signing you in…');const r=await api('/api/v1/auth/login','POST',{email,password},false);if(r.ok&&r.data?.access_token){token=r.data.access_token;userEmail=email;localStorage.setItem('jobyn_token',token);localStorage.setItem('jobyn_email',email);initApp()}else showMsg(msg,'err',esc(r.data?.detail||'Login failed. Please check your credentials and try again.'))}
 async function doRegister(){const full_name=document.getElementById('reg-name').value.trim(),email=document.getElementById('reg-email').value.trim(),password=document.getElementById('reg-password').value,msg=document.getElementById('reg-msg');if(!full_name||!email||!password){showMsg(msg,'err','Please enter your full name, email and password.');return}showMsg(msg,'info',spin()+'Creating your profile…');const r=await api('/api/v1/auth/register','POST',{email,password,full_name},false);if(r.ok){document.getElementById('login-email').value=email;document.getElementById('login-password').value=password;showMsg(msg,'ok','Account created. Signing you in…');await doLogin()}else{const detail=r.data?.detail;const message=Array.isArray(detail)?detail.map(item=>typeof item==='string'?item:item?.msg).filter(Boolean).join(' '):detail;showMsg(msg,'err',esc(typeof message==='string'&&message?message:'Registration failed.'))}}
@@ -285,6 +286,95 @@ let tailoringJDReady = false;
 let tailoringJDText  = '';   // full, untruncated JD text
 let tailoringAnalysisReady = false;
 let tailoringAnalysisData = null;
+
+async function restoreTailoringSession() {
+  const [cvResult, jdResult, analysisResult, tailoredCVResult] = await Promise.all([
+    api('/api/v1/tailoring/cv/latest'),
+    api('/api/v1/tailoring/job-description/latest'),
+    api('/api/v1/tailoring/analysis/latest'),
+    api('/api/v1/tailoring/cv/tailored/latest'),
+  ]);
+  const errors = [];
+  const cv = cvResult.ok ? cvResult.data : null;
+  const jd = jdResult.ok ? jdResult.data : null;
+  const analysis = analysisResult.ok ? analysisResult.data : null;
+  const tailoredCV = tailoredCVResult.ok ? tailoredCVResult.data : null;
+
+  if (cv) {
+    _showTailorCVStatus(cv);
+    tailoringCVReady = cv.extraction_status === 'succeeded' &&
+      Boolean((cv.extracted_text || cv.pasted_text || '').trim());
+  } else if (cvResult.status !== 404) {
+    errors.push('CV');
+  }
+
+  if (jd) {
+    _showTailorJDStatus(jd);
+    tailoringJDText = jd.extracted_text || jd.pasted_text || '';
+    tailoringJDReady = jd.extraction_status === 'succeeded' && Boolean(tailoringJDText.trim());
+  } else if (jdResult.status !== 404) {
+    errors.push('job description');
+  }
+
+  const analysisMatchesDocuments = analysis && cv && jd &&
+    analysis.cv_document_id === cv.id && analysis.jd_document_id === jd.id;
+  if (analysis) {
+    tailoringAnalysisData = analysis;
+    tailoringAnalysisReady = Boolean(analysisMatchesDocuments) &&
+      !analysis.error && Boolean(analysis.recommendations);
+    _showRestoredTailoringAnalysis(analysis, tailoringAnalysisReady, !analysisMatchesDocuments);
+    document.getElementById('tailor-generate-cv-bar')
+      ?.classList.toggle('hide', !tailoringAnalysisReady);
+  } else {
+    tailoringAnalysisData = null;
+    tailoringAnalysisReady = false;
+    document.getElementById('tailor-generate-cv-bar')?.classList.add('hide');
+    if (analysisResult.status !== 404) errors.push('analysis');
+  }
+
+  if (tailoredCV) {
+    _applyTailoredCV(tailoredCV);
+  } else if (tailoredCVResult.status !== 404) {
+    errors.push('tailored CV');
+  }
+
+  _checkTailoringProceed();
+  const status = document.getElementById('tailor-restore-status');
+  if (!status) return;
+  if (errors.length) {
+    status.classList.remove('hide');
+    showMsg(status, 'err',
+      `Some saved tailoring data could not be restored (${errors.join(', ')}). Refresh the page to try again.`
+    );
+  } else if (cv || jd || analysis || tailoredCV) {
+    status.classList.remove('hide');
+    showMsg(status, 'ok', 'Your saved Tailoring Studio session has been restored.');
+  }
+}
+
+function _showRestoredTailoringAnalysis(analysis, isComplete, isStale) {
+  initTailoringTab();
+  const jd = analysis.jd_analysis || {};
+  const match = analysis.match_result || {};
+  const recommendations = analysis.recommendations || {};
+  const matchedCount = (match.matching_skills || []).length;
+  const missingCount = (match.missing_requirements || []).length;
+  const actions = (recommendations.priority_actions || []).slice(0, 3);
+  const summary =
+    `<strong>${isComplete ? 'Saved CV-to-JD analysis restored.' : 'Saved analysis was incomplete.'}</strong><br>` +
+    `${esc(jd.job_title || 'Target role')}${jd.employer ? ` at ${esc(jd.employer)}` : ''}. ` +
+    `${matchedCount} matching skills, ${missingCount} missing requirements.` +
+    (actions.length
+      ? `<br>Priority actions: ${actions.map(esc).join(' · ')}`
+      : '') +
+    (isStale
+      ? '<br>This analysis belongs to older CV/JD files. Run analysis again before generating a CV.'
+      : '') +
+    (analysis.error
+      ? `<div style="margin-top:8px;color:var(--danger)">${esc(analysis.error)}</div>`
+      : '');
+  _chatAppend('jobyn', summary);
+}
 
 // ── JD detection heuristic ──────────────────────────────────────
 // Returns true when a message looks like a job description rather
