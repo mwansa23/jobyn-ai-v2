@@ -138,8 +138,11 @@ main{max-width:1160px;width:100%;margin:0 auto;padding:clamp(26px,5vw,64px) clam
 
   <!-- Proceed bar — visible once both CV and JD are ready -->
   <div id="tailor-proceed-bar" class="next-bar hide">
-    <p>CV and job description ready. Proceed to Application Copilot with your JD context pre-filled.</p>
-    <button class="btn" onclick="proceedToTailor()">Generate tailored application →</button>
+    <p>CV and job description ready. Analyze the match to generate a tailored CV.</p>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <button class="btn" id="tailor-analyze-btn" onclick="runTailoringAnalysis()">Analyze CV against JD →</button>
+      <button class="btn secondary" onclick="proceedToTailor()">Skip to Application Copilot</button>
+    </div>
   </div>
 
   <!-- Generate Tailored CV button — visible after analysis -->
@@ -409,6 +412,7 @@ async function _handleJDMessage(text, typingId) {
   if (r.ok) {
     tailoringJDText  = text;
     tailoringJDReady = true;
+    _invalidateTailoringAnalysis();
     const words = text.trim().split(/\s+/).filter(Boolean).length;
     _showTailorJDStatus(r.data);
     _checkTailoringProceed();
@@ -417,8 +421,8 @@ async function _handleJDMessage(text, typingId) {
       'What to do next:<br>' +
       '<ul style="margin:8px 0 0 16px;line-height:1.8">' +
       '<li>Make sure your CV is uploaded using the panel on the left</li>' +
-      '<li>Then say <em>"analyse this against my CV"</em> to run a full comparison</li>' +
-      '<li>Or click <strong>Generate tailored application &rarr;</strong> to proceed to the Application Copilot</li>' +
+      '<li>When both documents are ready, click <strong>Analyze CV against JD</strong> to run the comparison</li>' +
+      '<li>After analysis, generate your tailored CV or skip to Application Copilot</li>' +
       '</ul>'
     );
   } else {
@@ -498,6 +502,8 @@ async function _handleFollowUpMessage(text, typingId) {
 
 // ── Run analysis via API and display results in chat ─────────────
 async function _runAnalysisChat(userMessage) {
+  tailoringAnalysisReady = false;
+  document.getElementById('tailor-generate-cv-bar')?.classList.add('hide');
   _chatAppend('jobyn', spin() + ' Analysing your CV against the job description…');
   const r = await api('/api/v1/tailoring/analyze', 'POST', {});
   _chatRemove('chat-typing-' + Date.now()); // remove the typing indicator if present
@@ -509,6 +515,7 @@ async function _runAnalysisChat(userMessage) {
   }
 
   if (!r.ok) {
+    tailoringAnalysisData = null;
     _chatAppend('jobyn',
       `<span style="color:var(--danger)">I could not complete the analysis: ${esc(r.data?.detail || 'unknown error')}.</span>`
     );
@@ -516,12 +523,15 @@ async function _runAnalysisChat(userMessage) {
   }
 
   const data = r.data;
-  tailoringAnalysisReady = true;
+  const analysisComplete = !data.error && Boolean(data.recommendations);
+  tailoringAnalysisReady = analysisComplete;
   tailoringAnalysisData = data;
 
   // Build a summary response based on what was asked
   const t = userMessage.toLowerCase();
-  let html = '<strong>Analysis complete.</strong><br><br>';
+  let html = analysisComplete
+    ? '<strong>Analysis complete.</strong><br><br>'
+    : '<strong>Analysis incomplete.</strong><br>The tailoring recommendations were not completed. Review the error below and run the analysis again.<br><br>';
 
   // Show JD summary
   if (data.jd_analysis) {
@@ -609,13 +619,31 @@ async function _runAnalysisChat(userMessage) {
 
   _chatAppend('jobyn', html);
 
-  // Show the proceed bar and the generate CV button
+  // Keep generation gated until every analysis stage needed by the generator succeeded.
   _checkTailoringProceed();
   const genBar = document.getElementById('tailor-generate-cv-bar');
-  if (genBar) genBar.classList.remove('hide');
+  if (genBar) genBar.classList.toggle('hide', !analysisComplete);
 }
 
 // ── CV upload ────────────────────────────────────────────────────
+function _invalidateTailoringAnalysis() {
+  tailoringAnalysisReady = false;
+  tailoringAnalysisData = null;
+  document.getElementById('tailor-generate-cv-bar')?.classList.add('hide');
+}
+
+async function runTailoringAnalysis() {
+  if (!tailoringCVReady || !tailoringJDReady) return;
+  const button = document.getElementById('tailor-analyze-btn');
+  if (!button || button.disabled) return;
+  button.disabled = true;
+  try {
+    await _runAnalysisChat('analyse this against my CV');
+  } finally {
+    button.disabled = false;
+  }
+}
+
 async function uploadTailoringCV() {
   const file = document.getElementById('tailor-cv-file').files[0];
   const msg  = document.getElementById('tailor-cv-msg');
@@ -634,6 +662,7 @@ async function uploadTailoringCV() {
       showMsg(msg, 'ok', 'CV uploaded and text extracted successfully.');
       _showTailorCVStatus(data);
       tailoringCVReady = true;
+      _invalidateTailoringAnalysis();
       _checkTailoringProceed();
       _chatAppend('jobyn',
         `CV saved — "${esc(data.original_filename || 'your CV')}" uploaded and text extracted. ` +
@@ -667,11 +696,12 @@ async function uploadTailoringJD() {
       _showTailorJDStatus(data);
       tailoringJDText  = data.extracted_text || '';
       tailoringJDReady = true;
+      _invalidateTailoringAnalysis();
       _checkTailoringProceed();
       const words = (data.extracted_text || '').trim().split(/\s+/).filter(Boolean).length;
       _chatAppend('jobyn',
         `Job description saved via upload — "${esc(data.original_filename || 'the file')}", ${words.toLocaleString()} words extracted.<br>` +
-        'When your CV is also ready, say <em>"analyse this against my CV"</em> or click <strong>Generate tailored application &rarr;</strong>.'
+        'When your CV is also ready, click <strong>Analyze CV against JD</strong> to start tailoring.'
       );
     } else {
       showMsg(msg, 'err', esc(data.detail || 'JD upload failed.'));
