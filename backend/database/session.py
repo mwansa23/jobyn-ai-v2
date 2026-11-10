@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import logging
+import os
 from collections.abc import AsyncGenerator
 
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -12,6 +15,9 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from backend.core.config import get_settings
+
+
+logger = logging.getLogger("uvicorn.error")
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +105,24 @@ async_session_maker = async_sessionmaker(
     expire_on_commit=False,
     autoflush=False,
     autocommit=False,
+)
+
+
+def _database_target(url: str) -> str:
+    parsed = make_url(url)
+    return (
+        f"driver={parsed.drivername}, host={parsed.host or 'local'}, "
+        f"port={parsed.port or '-'}, database={parsed.database or '-'}"
+    )
+
+
+logger.info(
+    "Database configuration (credentials redacted): source=%s; "
+    "settings=[%s]; engine=[%s]; session_maker=[%s]",
+    "process environment" if "DATABASE_URL" in os.environ else ".env/default",
+    _database_target(settings.DATABASE_URL),
+    _database_target(DATABASE_URL),
+    _database_target(str(engine.url)),
 )
 
 
