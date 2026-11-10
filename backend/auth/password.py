@@ -7,6 +7,7 @@ bcrypt and still verifies existing bcrypt hashes.
 
 from __future__ import annotations
 
+import hashlib
 from typing import Final
 
 import bcrypt
@@ -23,6 +24,7 @@ except ImportError:  # pragma: no cover
 
 ALGORITHM_ARGON2_PREFIX: Final = "$argon2"
 ALGORITHM_BCRYPT_PREFIXES: Final[tuple[str, ...]] = ("$2a$", "$2b$", "$2y$")
+ALGORITHM_BCRYPT_SHA256_PREFIX: Final = "$bcrypt-sha256$"
 
 if PasswordHasher is not None:
     _password_hasher = PasswordHasher(
@@ -38,13 +40,18 @@ else:
 
 
 def _hash_with_bcrypt(password: str) -> str:
-    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+    digest = hashlib.sha256(password.encode("utf-8")).hexdigest().encode("ascii")
+    hashed = bcrypt.hashpw(digest, bcrypt.gensalt()).decode("utf-8")
+    return f"{ALGORITHM_BCRYPT_SHA256_PREFIX}{hashed}"
 
 
-def _verify_with_bcrypt(password: str, hashed_password: str) -> bool:
+def _verify_with_bcrypt(password: str, hashed_password: str, *, prehashed: bool = False) -> bool:
     try:
+        password_bytes = password.encode("utf-8")
+        if prehashed:
+            password_bytes = hashlib.sha256(password_bytes).hexdigest().encode("ascii")
         return bcrypt.checkpw(
-            password.encode("utf-8"),
+            password_bytes,
             hashed_password.encode("utf-8"),
         )
     except (ValueError, TypeError):
@@ -72,6 +79,13 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
             return _password_hasher.verify(hashed_password, plain_password)
         except (InvalidHash, VerifyMismatchError):
             return False
+
+    if hashed_password.startswith(ALGORITHM_BCRYPT_SHA256_PREFIX):
+        return _verify_with_bcrypt(
+            plain_password,
+            hashed_password[len(ALGORITHM_BCRYPT_SHA256_PREFIX) :],
+            prehashed=True,
+        )
 
     if hashed_password.startswith(ALGORITHM_BCRYPT_PREFIXES):
         return _verify_with_bcrypt(plain_password, hashed_password)
