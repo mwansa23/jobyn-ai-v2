@@ -85,9 +85,9 @@ class CandidateProfileService:
         try:
             profile = await generate_json(prompt)
         except LLMError as exc:
-    raise CandidateProfileError(
-        "Failed to generate the candidate profile."
-    ) from exc
+            raise CandidateProfileError(
+                "Failed to generate the candidate profile."
+            ) from exc
 
         return self._normalize_profile(profile)
 
