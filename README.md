@@ -246,6 +246,27 @@ Implemented end-to-end through the architecture (model → repository → servic
   `decode_token(token)`; `backend/services/user.py` owns password hashing,
   email normalization, uniqueness checks, and credential verification.
 - The JWT carries `sub` (the user UUID), `iat`, `exp`, and `type`.
+- Supabase access tokens are verified separately against the configured
+  project issuer, `authenticated` audience, expiry, UUID subject, and signing
+  key. Asymmetric keys are fetched from the project's JWKS endpoint; legacy
+  HS256 projects also require a 32-byte-or-longer `SUPABASE_JWT_SECRET`.
+- Configure `SUPABASE_URL` to the project URL. New-user provisioning and
+  automatic email-based account linking require a signed
+  `email_verified: true` claim. If the project does not include that claim,
+  configure a trusted Supabase access-token hook based on the auth record's
+  confirmation state, never user-editable metadata, before enabling provisioning.
+- Existing accounts are resolved first by `supabase_user_id`. An unmapped
+  identity can link only to exactly one matching, non-deleted Jobyn account
+  using the verified token email. Conflicts require manual resolution; the
+  Jobyn UUID, account status, role, and related records are preserved.
+- Supabase-only accounts have no password hash and cannot use legacy password
+  login. Legacy Jobyn login remains available during the transition, and both
+  token types resolve to the same Jobyn user record. Roles are read only from
+  the backend database or trusted `ADMIN_EMAILS` configuration.
+- Supabase session refresh and logout remain frontend responsibilities. Apply
+  the additive Alembic migration before deploying code that uses the new
+  mapping field. Its downgrade is blocked while any Supabase mappings exist;
+  after rollout, revert application code without dropping the mapping schema.
 - Protected endpoints use the `get_current_user` dependency from
   `backend/api/deps.py`, which validates the `Authorization: Bearer <jwt>`
   header and resolves the subject against the `User` model.

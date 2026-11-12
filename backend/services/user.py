@@ -42,7 +42,11 @@ class UserService(BaseService[UserRepository]):
     async def authenticate(self, email: str, password: str) -> User:
         """Verify credentials and return the account, or raise on failure."""
         user = await self.repository.get_by_email(email.strip().lower())
-        if user is None or not verify_password(password, user.hashed_password):
+        if (
+            user is None
+            or user.hashed_password is None
+            or not verify_password(password, user.hashed_password)
+        ):
             raise AuthenticationError("Invalid email or password")
         if not user.is_active:
             raise AuthorizationError("This account is disabled")

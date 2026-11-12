@@ -5,9 +5,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
 
 Environment = Literal["development", "test", "staging", "production"]
 LLMProviderName = Literal["freellmapi", "nvidia"]
@@ -57,6 +56,10 @@ class Settings(BaseSettings):
     JWT_ALGORITHM: str = "HS256"
 
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+
+    # Supabase project URL is public; the JWT secret is needed only for legacy HS256 projects.
+    SUPABASE_URL: str | None = None
+    SUPABASE_JWT_SECRET: SecretStr | None = None
 
     # Comma-separated administrator email addresses. Empty means no admin access.
     ADMIN_EMAILS: str | list[str] = Field(default_factory=list)

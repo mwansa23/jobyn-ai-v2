@@ -15,11 +15,12 @@ of each use case so routes stay free of session lifecycle concerns.
 from __future__ import annotations
 
 from typing import Any
+from uuid import UUID
 
 from fastapi import HTTPException, status
 from sqlalchemy.exc import IntegrityError
 
-from backend.auth.jwt import create_access_token
+from backend.auth.jwt import InvalidTokenError, create_access_token
 from backend.auth.password import hash_password, verify_password
 from backend.core.config import settings
 from backend.models.user import User
@@ -65,6 +66,16 @@ class InvalidCredentialsError(AuthServiceError):
         super().__init__(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid email or password.",
+        )
+
+
+class SupabaseIdentityConflictError(AuthServiceError):
+    """Raised when an identity cannot be linked without manual review."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This Supabase identity conflicts with an existing account and requires review.",
         )
 
 
@@ -169,12 +180,86 @@ class AuthService(BaseService[UserRepository]):
             _ = verify_password(password, _DUMMY_PASSWORD_HASH)
             raise InvalidCredentialsError()
 
+        if not user.hashed_password:
+            _ = verify_password(password, _DUMMY_PASSWORD_HASH)
+            raise InvalidCredentialsError()
+
         if not verify_password(password, user.hashed_password):
             raise InvalidCredentialsError()
 
         if not user.is_active:
             raise InvalidCredentialsError()
 
+        return user
+
+    async def resolve_supabase_user(self, claims: dict[str, Any]) -> User:
+        """Resolve or provision the Jobyn account for a verified Supabase token.
+
+        Existing mappings take precedence. An unmapped identity may link only
+        through a verified token email with exactly one matching, non-deleted
+        Jobyn account; all conflicting identities require manual resolution.
+        """
+        raw_subject = claims.get("sub")
+        try:
+            supabase_user_id = UUID(raw_subject)
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise InvalidTokenError(detail="Invalid Supabase subject.") from exc
+
+        user = await self.user_repository.get_by_supabase_user_id(supabase_user_id)
+        if user is not None:
+            return user
+
+        raw_email = claims.get("email")
+        if claims.get("email_verified") is not True:
+            raise InvalidTokenError(detail="A verified Supabase email is required.")
+        if not isinstance(raw_email, str) or not raw_email.strip():
+            raise InvalidTokenError(detail="A verified Supabase email is required.")
+        email = _normalize_email(raw_email)
+
+        candidates = await self.user_repository.get_email_link_candidates(email)
+        if len(candidates) > 1:
+            raise SupabaseIdentityConflictError()
+        try:
+            if candidates:
+                user = candidates[0]
+                if user.deleted_at is not None or (
+                    user.supabase_user_id is not None and user.supabase_user_id != supabase_user_id
+                ):
+                    raise SupabaseIdentityConflictError()
+                linked = await self.user_repository.link_supabase_identity(
+                    user.id,
+                    supabase_user_id,
+                )
+                if not linked:
+                    await self.rollback()
+                    existing = await self.user_repository.get_by_supabase_user_id(supabase_user_id)
+                    if existing is not None:
+                        return existing
+                    raise SupabaseIdentityConflictError()
+                user.supabase_user_id = supabase_user_id
+            else:
+                # End the read transaction before inserting so concurrent
+                # SQLite requests do not try to upgrade stale read snapshots.
+                await self.rollback()
+                user = await self.user_repository.create(
+                    email=email,
+                    hashed_password=None,
+                    full_name=None,
+                    supabase_user_id=supabase_user_id,
+                    is_active=True,
+                    is_verified=True,
+                    role="user",
+                )
+            await self.commit()
+        except IntegrityError as exc:
+            await self.rollback()
+            # A concurrent request may have created or linked this same identity.
+            user = await self.user_repository.get_by_supabase_user_id(supabase_user_id)
+            if user is not None:
+                return user
+            raise SupabaseIdentityConflictError() from exc
+
+        await self.user_repository.session.refresh(user)
         return user
 
     def create_access_token_response(
@@ -219,4 +304,5 @@ __all__ = [
     "AuthServiceError",
     "EmailAlreadyRegisteredError",
     "InvalidCredentialsError",
+    "SupabaseIdentityConflictError",
 ]

@@ -14,6 +14,7 @@ from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.auth.jwt import InvalidTokenError, verify_token
+from backend.auth.supabase import has_issuer_claim, verify_supabase_access_token
 from backend.core.config import get_settings
 from backend.database.session import async_session_maker
 from backend.models.user import User
@@ -67,21 +68,32 @@ async def get_auth_service(
 
 async def get_current_user(
     token: str = Depends(oauth2_scheme),
-    repository: UserRepository = Depends(get_user_repository),
+    auth_service: AuthService = Depends(get_auth_service),
 ) -> User:
-    """Resolve the authenticated user from a JWT bearer token."""
+    """Resolve a Supabase or legacy token to the canonical Jobyn user."""
+    user: User | None
+    if has_issuer_claim(token):
+        claims = await verify_supabase_access_token(token)
+        user = await auth_service.resolve_supabase_user(claims)
+    else:
+        payload = verify_token(token)
+        if payload.get("type") != "access":
+            raise InvalidTokenError(detail="An access token is required.")
 
-    payload = verify_token(token)
+        try:
+            subject = uuid.UUID(payload["sub"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise InvalidTokenError() from exc
 
-    try:
-        subject = uuid.UUID(payload["sub"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise InvalidTokenError() from exc
-
-    user = await repository.get(subject)
+        user = await auth_service.user_repository.get(subject)
 
     if user is None:
         raise InvalidTokenError()
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This account is inactive.",
+        )
 
     return user
 

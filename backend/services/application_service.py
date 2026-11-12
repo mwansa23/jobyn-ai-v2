@@ -42,10 +42,21 @@ logger = logging.getLogger(__name__)
 # Status transition map                                                #
 # ------------------------------------------------------------------ #
 
-# Candidates may update their self-reported status to any other lifecycle state.
+# Apply a strict lifecycle, with only the valid next-step transitions allowed.
+# Any non-terminal active stage can end in a withdrawal, while the terminal
+# states are not allowed to transition onward.
 _ALLOWED_TRANSITIONS: dict[ApplicationStatus, frozenset[ApplicationStatus]] = {
-    current: frozenset(candidate for candidate in ApplicationStatus if candidate != current)
-    for current in ApplicationStatus
+    ApplicationStatus.DRAFT: frozenset({ApplicationStatus.APPLIED, ApplicationStatus.WITHDRAWN}),
+    ApplicationStatus.APPLIED: frozenset({ApplicationStatus.UNDER_REVIEW, ApplicationStatus.WITHDRAWN}),
+    ApplicationStatus.UNDER_REVIEW: frozenset(
+        {ApplicationStatus.INTERVIEWING, ApplicationStatus.REJECTED, ApplicationStatus.WITHDRAWN}
+    ),
+    ApplicationStatus.INTERVIEWING: frozenset(
+        {ApplicationStatus.OFFERED, ApplicationStatus.REJECTED, ApplicationStatus.WITHDRAWN}
+    ),
+    ApplicationStatus.OFFERED: frozenset(),
+    ApplicationStatus.REJECTED: frozenset(),
+    ApplicationStatus.WITHDRAWN: frozenset(),
 }
 
 _INITIAL_ALLOWED = frozenset({ApplicationStatus.DRAFT, ApplicationStatus.APPLIED})

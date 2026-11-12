@@ -1,0 +1,1031 @@
+﻿diff --git a/backend/ai/cv_editor.py b/backend/ai/cv_editor.py
+index ee318ff..2289fa3 100644
+--- a/backend/ai/cv_editor.py
++++ b/backend/ai/cv_editor.py
+@@ -14,6 +14,8 @@ from __future__ import annotations
+ 
+ import json
+ import logging
++import re
++from copy import deepcopy
+ from typing import Any
+ 
+ from backend.ai.llm import LLMError, generate_json
+@@ -30,13 +32,28 @@ _OUTPUT_SCHEMA = """{
+       "source": "original|rewritten|candidate_confirmed"
+     }
+   ],
+-  "edit_summary": ""
++  "edit_summary": "",
++  "section_explanations": [
++    {"section_index": 0, "explanation": ""}
++  ],
++  "needs_clarification": false,
++  "clarification_question": ""
+ }"""
+ 
+-_REQUIRED_FIELDS = (
+-    "sections",
+-    "edit_summary",
+-)
++_SECTION_ALIASES = {
++    "summary": ("professional summary", "summary", "profile", "objective"),
++    "experience": (
++        "professional experience",
++        "work experience",
++        "work history",
++        "employment history",
++    ),
++    "skills": ("technical skills", "core skills", "skills"),
++    "education": ("education", "academic background"),
++    "certifications": ("certifications", "certificates", "licenses"),
++    "projects": ("projects", "selected projects"),
++    "contact": ("contact information", "contact details", "contact"),
++}
+ 
+ 
+ class CVEditorError(Exception):
+@@ -70,7 +87,10 @@ class CVEditorService:
+         if not edit_request or not edit_request.strip():
+             raise CVEditorError("Edit request must not be empty.")
+ 
+-        prompt = self._build_prompt(current_cv, edit_request, original_cv_text)
++        target_index = self._detect_target_section(current_cv, edit_request)
++        prompt = self._build_prompt(
++            current_cv, edit_request, original_cv_text, target_index
++        )
+ 
+         try:
+             result = await generate_json(prompt, max_tokens=8192)
+@@ -83,22 +103,92 @@ class CVEditorService:
+             )
+             raise CVEditorError("Failed to apply the edit to the CV.") from exc
+ 
+-        return self._normalize_response(result)
++        normalized = self._normalize_response(result)
++        if normalized["needs_clarification"]:
++            if not normalized["clarification_question"].strip():
++                raise CVEditorError(
++                    "The editor requested clarification without providing a question."
++                )
++            return normalized
++
++        if target_index is not None:
++            current_sections = current_cv.get("sections")
++            edited_sections = normalized["sections"]
++            if (
++                not isinstance(current_sections, list)
++                or len(edited_sections) != len(current_sections)
++                or not isinstance(edited_sections[target_index], dict)
++            ):
++                raise CVEditorError(
++                    "The section-specific edit did not return the complete CV structure."
++                )
++            sections = deepcopy(current_sections)
++            sections[target_index] = edited_sections[target_index]
++            normalized["sections"] = sections
++        return normalized
++
++    @staticmethod
++    def _detect_target_section(
++        current_cv: dict[str, Any],
++        edit_request: str,
++    ) -> int | None:
++        """Return the sole clearly named section, otherwise preserve whole-CV mode."""
++        sections = current_cv.get("sections")
++        if not isinstance(sections, list):
++            return None
++
++        request = edit_request.casefold()
++        matches: set[int] = set()
++        for index, section in enumerate(sections):
++            if not isinstance(section, dict):
++                continue
++            names = {
++                str(section.get("heading") or "").casefold().strip(),
++                str(section.get("type") or "").casefold().strip(),
++            }
++            for name in tuple(names):
++                names.update(_SECTION_ALIASES.get(name, ()))
++            for name in names:
++                if not name or name == "other":
++                    continue
++                # "Experience" alone often describes a candidate's history,
++                # not an explicit request to edit the Experience section.
++                if name == "experience":
++                    pattern = r"\b(?:experience\s+section|section\s*:\s*experience)\b"
++                else:
++                    pattern = rf"\b{re.escape(name)}\b"
++                if re.search(pattern, request):
++                    matches.add(index)
++                    break
++        return next(iter(matches)) if len(matches) == 1 else None
+ 
+     @staticmethod
+     def _build_prompt(
+         current_cv: dict[str, Any],
+         edit_request: str,
+         original_cv_text: str,
++        target_index: int | None,
+     ) -> str:
+         """Build the prompt for applying a conversational edit."""
+-        serialized_cv = json.dumps(current_cv, ensure_ascii=False, indent=2)
++        cv_for_edit = {
++            key: value for key, value in current_cv.items() if key != "comparison"
++        }
++        serialized_cv = json.dumps(cv_for_edit, ensure_ascii=False, indent=2)
+         original_ref = (
+             f"\n\nOriginal CV text (for reference ΓÇö do not fabricate beyond this):\n"
+             f"{original_cv_text.strip()}"
+             if original_cv_text and original_cv_text.strip()
+             else ""
+         )
++        target_instruction = ""
++        if target_index is not None:
++            target = current_cv["sections"][target_index]
++            target_instruction = (
++                f"\n\nThis is a section-specific request. Only section index "
++                f"{target_index} ({target.get('heading') or target.get('type')}) "
++                "may be edited. Return all sections in their original order, "
++                "leaving every other section byte-for-byte unchanged.\n"
++            )
+         return (
+             "You are an expert professional CV editor. The candidate has "
+             "requested a change to their tailored CV. Apply the change to "
+@@ -109,15 +199,22 @@ class CVEditorService:
+             "- NEVER invent qualifications, employers, dates, skills, or "
+             "achievements not present in the current CV or original CV.\n"
+             "- Only rewrite, reorganise, or improve existing content.\n"
+-            "- If the edit request asks for something that requires new "
+-            "information the candidate has not provided, note this in "
+-            "``edit_summary`` and make the best improvement possible with "
+-            "existing content.\n"
++            "- If a requested change depends on essential factual information "
++            "that is not present in the current or original CV, do not change "
++            "the CV. Set ``needs_clarification`` to true and ask one concise "
++            "question in ``clarification_question``. Do not guess or fabricate.\n"
+             "- Set ``source`` to 'candidate_confirmed' for any section that "
+             "incorporates candidate-provided information from the edit request.\n"
+             "- Return the COMPLETE CV with all sections, not just the "
+             "changed section.\n"
+             "- ``edit_summary`` should briefly describe what was changed.\n\n"
++            "- Return ``section_explanations`` with one concise explanation "
++            "for each changed section, using its zero-based index in the "
++            "returned sections list. Explain how the change follows the "
++            "candidate's request and available CV evidence. Do not claim "
++            "ATS compatibility or improved job suitability unless supported "
++            "by explicit evidence in the request or supplied CV content.\n"
++            f"{target_instruction}"
+             "Current tailored CV:\n"
+             f"{serialized_cv}\n\n"
+             f"Candidate edit request: {edit_request.strip()}"
+@@ -128,10 +225,24 @@ class CVEditorService:
+     def _normalize_response(result: dict[str, Any]) -> dict[str, Any]:
+         """Ensure every expected key is present with the correct type."""
+         normalized = dict(result)
+-        for field in _REQUIRED_FIELDS:
+-            value = normalized.get(field)
+-            if value is None:
+-                normalized[field] = [] if field == "sections" else ""
++        normalized.setdefault("sections", [])
++        normalized.setdefault("edit_summary", "")
++        normalized.setdefault("section_explanations", [])
++        normalized.setdefault("needs_clarification", False)
++        normalized.setdefault("clarification_question", "")
++        if not isinstance(normalized["needs_clarification"], bool):
++            raise CVEditorError("The editor returned an invalid clarification flag.")
++        if not isinstance(normalized["clarification_question"], str):
++            raise CVEditorError("The editor returned an invalid clarification question.")
++        if not isinstance(normalized["section_explanations"], list):
++            raise CVEditorError("The editor returned invalid section explanations.")
++        for explanation in normalized["section_explanations"]:
++            if (
++                not isinstance(explanation, dict)
++                or not isinstance(explanation.get("section_index"), int)
++                or not isinstance(explanation.get("explanation"), str)
++            ):
++                raise CVEditorError("The editor returned an invalid section explanation.")
+         if not isinstance(normalized.get("sections"), list):
+             normalized["sections"] = []
+         for section in normalized["sections"]:
+diff --git a/backend/api/routes/tailoring.py b/backend/api/routes/tailoring.py
+index 6a5d083..556231d 100644
+--- a/backend/api/routes/tailoring.py
++++ b/backend/api/routes/tailoring.py
+@@ -9,8 +9,9 @@ from __future__ import annotations
+ 
+ import logging
+ import uuid
++from copy import deepcopy
+ 
+-from fastapi import APIRouter, Depends, HTTPException, UploadFile, status
++from fastapi import APIRouter, Depends, HTTPException, Response, UploadFile, status
+ from sqlalchemy.ext.asyncio import AsyncSession
+ 
+ from backend.api.deps import get_current_user, get_session
+@@ -389,6 +390,7 @@ from backend.ai.cv_rewriter import CVRewriterError, CVRewriterService  # noqa: E
+ from backend.models.tailored_cv import TailoredCV  # noqa: E402
+ from backend.repositories.tailored_cv import TailoredCVRepository  # noqa: E402
+ from backend.schemas.tailoring import (  # noqa: E402
++    EditCVClarification,
+     EditCVRequest,
+     GenerateCVRequest,
+     RevertCVRequest,
+@@ -463,28 +465,32 @@ async def get_latest_tailored_cv(
+ 
+ @router.post(
+     "/cv/edit",
+-    response_model=TailoredCVRead,
+-    status_code=status.HTTP_201_CREATED,
++    response_model=TailoredCVRead | EditCVClarification,
+     summary="Apply a conversational edit to the tailored CV",
+ )
+ async def edit_tailored_cv(
+     payload: EditCVRequest,
++    response: Response,
+     current_user: User = Depends(get_current_user),
+     service: TailoringGenerationService = Depends(_get_generation_service),
+-) -> TailoredCVRead:
++) -> TailoredCVRead | EditCVClarification:
+     """Apply a natural-language edit request to the latest tailored CV.
+ 
+     Creates a new version with the updated content. Previous versions are preserved.
+     """
+     try:
+-        cv = await service.apply_edit(current_user.id, payload.message)
++        result = await service.apply_edit(current_user.id, payload.message)
+     except TailoringGenerationError as exc:
+         raise HTTPException(
+             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+             detail=str(exc),
+         ) from exc
+ 
+-    return TailoredCVRead.model_validate(cv)
++    if isinstance(result, dict):
++        return EditCVClarification.model_validate(result)
++
++    response.status_code = status.HTTP_201_CREATED
++    return TailoredCVRead.model_validate(result)
+ 
+ 
+ @router.get(
+@@ -525,7 +531,21 @@ async def get_tailored_cv(
+             status_code=status.HTTP_404_NOT_FOUND,
+             detail="Tailored CV not found.",
+         )
+-    return TailoredCVRead.model_validate(cv)
++    response_data = TailoredCVRead.model_validate(cv)
++    latest = await service.get_latest_for_user(current_user.id)
++    response_data.content = deepcopy(response_data.content)
++    response_data.content["comparison"] = service.build_comparison(
++        latest.content.get("sections", []) if latest else [],
++        response_data.content.get("sections", []),
++        {},
++        fallback_explanation=(
++            f"Previewing version {cv.version_number} against current version "
++            f"{latest.version_number}."
++            if latest
++            else "Previewing the saved CV version."
++        ),
++    )
++    return response_data
+ 
+ 
+ @router.patch(
+@@ -572,6 +592,7 @@ async def revert_cv(
+     This effectively undoes later changes. The original versions remain preserved.
+     """
+     try:
++        previous = await service.get_latest_for_user(current_user.id)
+         cv = await service.revert_to_version(current_user.id, payload.version_number)
+     except TailoringGenerationError as exc:
+         raise HTTPException(
+@@ -579,7 +600,15 @@ async def revert_cv(
+             detail=str(exc),
+         ) from exc
+ 
+-    return TailoredCVRead.model_validate(cv)
++    response_data = TailoredCVRead.model_validate(cv)
++    response_data.content = deepcopy(response_data.content)
++    response_data.content["comparison"] = service.build_comparison(
++        previous.content.get("sections", []) if previous else [],
++        response_data.content.get("sections", []),
++        {},
++        fallback_explanation=f"Restored from version {payload.version_number}.",
++    )
++    return response_data
+ 
+ 
+ @router.get(
+diff --git a/backend/demo.html b/backend/demo.html
+index c371583..9ba7595 100644
+--- a/backend/demo.html
++++ b/backend/demo.html
+@@ -167,6 +167,9 @@ main{max-width:1160px;width:100%;margin:0 auto;padding:clamp(26px,5vw,64px) clam
+     <!-- Change summary -->
+     <div id="tailor-cv-change-summary" class="hide" style="padding:10px 14px;border-radius:12px;background:#f0f5f3;font-size:12px;color:#3f6960;margin-bottom:16px"></div>
+ 
++    <!-- Exact before/after comparison for proposed edits -->
++    <div id="tailor-cv-comparison" class="hide" style="margin-bottom:18px"></div>
++
+     <!-- The A4-style document preview -->
+     <div id="tailor-cv-preview" class="cv-preview"></div>
+ 
+@@ -181,6 +184,12 @@ main{max-width:1160px;width:100%;margin:0 auto;padding:clamp(26px,5vw,64px) clam
+     <div id="tailor-cv-versions" class="hide" style="margin-top:16px;padding:14px;border:1px solid var(--line);border-radius:14px;background:#fafaf8">
+       <div class="label">Version History</div>
+       <div id="tailor-cv-versions-list" style="margin-top:8px"></div>
++      <div id="tailor-cv-history-preview" class="hide" style="margin-top:16px;padding-top:14px;border-top:1px solid var(--line)">
++        <div id="tailor-cv-history-preview-title" class="eyebrow"></div>
++        <div id="tailor-cv-history-comparison" style="margin-bottom:14px"></div>
++        <div id="tailor-cv-history-content" class="cv-preview"></div>
++        <button id="tailor-cv-history-restore" class="btn small" style="margin-top:14px" onclick="restoreSelectedCVVersion()">Restore this version</button>
++      </div>
+     </div>
+   </div>
+ 
+@@ -377,7 +386,9 @@ async function tailorChatSend() {
+   const typingId = _chatTyping();
+ 
+   // Route the message
+-  if (_looksLikeJD(text)) {
++  if (pendingCVEdit) {
++    await _handleFollowUpMessage(text, typingId);
++  } else if (_looksLikeJD(text)) {
+     await _handleJDMessage(text, typingId);
+   } else {
+     await _handleFollowUpMessage(text, typingId);
+@@ -417,8 +428,13 @@ async function _handleJDMessage(text, typingId) {
+ async function _handleFollowUpMessage(text, typingId) {
+   const t = text.toLowerCase();
+ 
++  if (pendingCVEdit) {
++    await handleCVEditRequest(text, typingId);
++    return;
++  }
++
+   // Route: CV edit requests (rewrite, improve, shorten, emphasise, undo) ΓÇö only if a tailored CV exists
+-  if (tailoredCVId && /rewrite|improve|shorten|emphas|emphasi|make.*(relevant|concise|ats)|incorporat|undo|revert|reorganis|reorganiz|add.*(achievement|responsibilit|skill|experience)|strengthen|polish|refine/.test(t)) {
++  if (tailoredCVId && /edit|update|change|rewrite|improve|shorten|emphas|emphasi|make.*(relevant|concise|ats)|incorporat|undo|revert|reorganis|reorganiz|add.*(achievement|responsibilit|skill|experience)|strengthen|polish|refine/.test(t)) {
+     await handleCVEditRequest(text, typingId);
+     return;
+   }
+@@ -735,6 +751,8 @@ function proceedToTailor() {
+ let tailoredCVId = null;
+ let tailoredCVVersion = 0;
+ let tailoredCVStatus = 'pending';
++let pendingCVEdit = null;
++let selectedHistoryCV = null;
+ 
+ // ΓöÇΓöÇ Generate Tailored CV ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+ async function generateTailoredCV() {
+@@ -788,11 +806,60 @@ function _applyTailoredCV(cvData) {
+     }
+   }
+   // Render the CV preview
++  renderCVComparison(cvData.content?.comparison || []);
+   renderCVPreview(cvData.content);
+ }
+ 
+-function renderCVPreview(content) {
+-  const el = document.getElementById('tailor-cv-preview');
++function _comparisonSectionText(section) {
++  if (!section) return '<span class="tiny">Section not present in this version.</span>';
++  const parts = [];
++  if (section.content) parts.push(String(section.content));
++  for (const item of section.items || []) {
++    if (typeof item === 'string') parts.push('ΓÇó ' + item);
++    else if (item && typeof item === 'object') parts.push(JSON.stringify(item, null, 2));
++  }
++  return parts.length ? esc(parts.join('\n')) : '<span class="tiny">(No section content)</span>';
++}
++
++function renderCVComparison(
++  comparison,
++  targetId = 'tailor-cv-comparison',
++  headingText = 'Review changes',
++  beforeLabel = 'Before',
++  afterLabel = 'After',
++  introText = 'Compare the saved version with this proposal before accepting or rejecting it.'
++) {
++  const el = document.getElementById(targetId);
++  if (!el) return;
++  const entries = Array.isArray(comparison) ? comparison : [];
++  if (!entries.length) {
++    el.innerHTML = '';
++    el.classList.add('hide');
++    return;
++  }
++  const changed = entries.filter(entry => entry.status !== 'unchanged');
++  el.classList.remove('hide');
++  el.innerHTML = `<div class="card" style="margin-bottom:0"><div class="eyebrow">${esc(headingText)}</div>` +
++    (changed.length
++      ? `<p class="muted" style="font-size:12px;margin-bottom:14px">${changed.length} section${changed.length === 1 ? '' : 's'} changed. ${esc(introText)}</p>`
++      : '<p class="muted" style="font-size:12px;margin-bottom:14px">No section content changed.</p>') +
++    entries.map(entry => {
++      const heading = esc(entry.heading || 'Section');
++      if (entry.status === 'unchanged') {
++        return `<div style="padding:10px 0;border-top:1px solid var(--line);font-size:12px"><strong>${heading}</strong> <span class="tiny">Unchanged</span></div>`;
++      }
++      const status = entry.status === 'added' ? 'Added' : entry.status === 'removed' ? 'Removed' : 'Changed';
++      return `<div style="padding:14px 0;border-top:1px solid var(--line)"><strong>${heading} ┬╖ ${status}</strong>` +
++        `<div class="grid-2" style="gap:10px;margin-top:10px">` +
++        `<div><div class="label">${esc(beforeLabel)}</div><div class="prose" style="white-space:pre-wrap">${_comparisonSectionText(entry.before)}</div></div>` +
++        `<div><div class="label">${esc(afterLabel)}</div><div class="prose" style="white-space:pre-wrap">${_comparisonSectionText(entry.after)}</div></div></div>` +
++        (entry.explanation ? `<p class="tiny" style="margin-top:10px"><strong>Why this change:</strong> ${esc(entry.explanation)}</p>` : '') +
++        '</div>';
++    }).join('') + '</div>';
++}
++
++function renderCVPreview(content, targetId = 'tailor-cv-preview') {
++  const el = document.getElementById(targetId);
+   if (!el || !content) return;
+   const sections = content.sections || [];
+   let html = '';
+@@ -845,7 +912,10 @@ async function handleCVEditRequest(editText, typingId) {
+     return;
+   }
+   _chatAppend('jobyn', spin() + ' Applying your edit to the CVΓÇª');
+-  const r = await api('/api/v1/tailoring/cv/edit', 'POST', { message: editText });
++  const message = pendingCVEdit
++    ? `Original edit request: ${pendingCVEdit.request}\nCandidate clarification: ${[...pendingCVEdit.answers, editText].join('\n')}`
++    : editText;
++  const r = await api('/api/v1/tailoring/cv/edit', 'POST', { message });
+   // Remove the "ApplyingΓÇª" message
+   const thread = document.getElementById('tailor-chat-thread');
+   if (thread && thread.lastElementChild) {
+@@ -858,6 +928,17 @@ async function handleCVEditRequest(editText, typingId) {
+     );
+     return;
+   }
++  if (r.data?.needs_clarification) {
++    pendingCVEdit = {
++      request: pendingCVEdit?.request || editText,
++      answers: [...(pendingCVEdit?.answers || []), editText],
++    };
++    _chatAppend('jobyn',
++      `${esc(r.data.clarification_question || 'Please provide the missing information before I update your CV.')}`
++    );
++    return;
++  }
++  pendingCVEdit = null;
+   _applyTailoredCV(r.data);
+   _chatAppend('jobyn',
+     `<strong>CV updated ΓÇö version ${r.data.version_number}.</strong><br>` +
+@@ -902,16 +983,65 @@ async function revertCVVersionPrompt() {
+ }
+ 
+ async function revertCVVersion(versionNum) {
++  const confirmed = window.confirm(
++    `Restore saved CV version ${versionNum} as a new version? Your existing versions will be preserved.`
++  );
++  if (!confirmed) return;
+   const r = await api('/api/v1/tailoring/cv/revert', 'POST', { version_number: versionNum });
+   if (r.ok) {
+     _applyTailoredCV(r.data);
+-    _chatAppend('jobyn', `Reverted to version ${versionNum}. New version ${r.data.version_number} created. Review below.`);
++    selectedHistoryCV = null;
++    document.getElementById('tailor-cv-history-preview')?.classList.add('hide');
++    await showCVVersions();
++    _chatAppend('jobyn', `Restored version ${versionNum} as new version ${r.data.version_number}. Earlier versions remain in history.`);
+     document.getElementById('tailor-cv-preview-section')?.scrollIntoView({behavior:'smooth'});
+   } else {
+     _chatAppend('jobyn', `<span style="color:var(--danger)">Could not revert: ${esc(r.data?.detail || 'error')}</span>`);
+   }
+ }
+ 
++async function previewCVVersion(cvId) {
++  const panel = document.getElementById('tailor-cv-history-preview');
++  const title = document.getElementById('tailor-cv-history-preview-title');
++  const content = document.getElementById('tailor-cv-history-content');
++  const comparison = document.getElementById('tailor-cv-history-comparison');
++  if (!panel || !title || !content || !comparison) return;
++  selectedHistoryCV = null;
++  const restoreButton = document.getElementById('tailor-cv-history-restore');
++  if (restoreButton) restoreButton.disabled = true;
++  panel.classList.remove('hide');
++  title.textContent = 'Loading saved versionΓÇª';
++  content.innerHTML = spin();
++  comparison.innerHTML = '';
++  const r = await api(`/api/v1/tailoring/cv/${cvId}`);
++  if (!r.ok) {
++    title.textContent = 'Could not load this saved version.';
++    content.innerHTML = '';
++    return;
++  }
++  selectedHistoryCV = r.data;
++  title.textContent = `Selected historical version v${r.data.version_number} ┬╖ current version v${tailoredCVVersion}`;
++  renderCVComparison(
++    r.data.content?.comparison || [],
++    'tailor-cv-history-comparison',
++    `Version ${r.data.version_number} compared with current v${tailoredCVVersion}`,
++    `Current v${tailoredCVVersion}`,
++    `Selected v${r.data.version_number}`,
++    'The preview is read-only. Restore creates a new version and keeps all saved versions.'
++  );
++  renderCVPreview(r.data.content, 'tailor-cv-history-content');
++  if (restoreButton) {
++    const isCurrent = r.data.version_number === tailoredCVVersion;
++    restoreButton.disabled = isCurrent;
++    restoreButton.textContent = isCurrent ? 'This is the current version' : 'Restore this version';
++  }
++}
++
++async function restoreSelectedCVVersion() {
++  if (!selectedHistoryCV) return;
++  await revertCVVersion(selectedHistoryCV.version_number);
++}
++
+ async function showCVVersions() {
+   const el = document.getElementById('tailor-cv-versions');
+   const listEl = document.getElementById('tailor-cv-versions-list');
+@@ -924,6 +1054,9 @@ async function showCVVersions() {
+     return;
+   }
+   const versions = r.data.items || [];
++  if (selectedHistoryCV && !versions.some(v => v.id === selectedHistoryCV.id)) {
++    selectedHistoryCV = null;
++  }
+   if (!versions.length) {
+     listEl.innerHTML = '<span class="tiny">No versions yet.</span>';
+     return;
+@@ -933,10 +1066,11 @@ async function showCVVersions() {
+     return `<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--line)">
+       <div><strong>v${v.version_number}</strong> <span class="tiny">${esc(v.edit_type)}</span>
+       ${v.change_summary ? '<br><span class="tiny">' + esc(v.change_summary.slice(0,100)) + '</span>' : ''}
++      ${v.version_number === tailoredCVVersion ? '<br><span class="tiny" style="color:var(--accent)">Current version</span>' : ''}
+       </div>
+       <div style="display:flex;gap:6px;align-items:center">
+         <span style="font-size:11px;font-weight:700;color:${statusColor}">${esc(v.status)}</span>
+-        ${v.version_number !== tailoredCVVersion ? `<button class="btn secondary small" onclick="revertCVVersion(${v.version_number})">Revert</button>` : '<span class="tiny" style="color:var(--accent)">current</span>'}
++        <button class="btn secondary small" onclick="previewCVVersion('${v.id}')">${selectedHistoryCV?.id === v.id ? 'Selected' : 'Preview'}</button>
+       </div>
+     </div>`;
+   }).join('');
+diff --git a/backend/schemas/tailoring.py b/backend/schemas/tailoring.py
+index a1b6476..e4e9541 100644
+--- a/backend/schemas/tailoring.py
++++ b/backend/schemas/tailoring.py
+@@ -4,7 +4,7 @@ from __future__ import annotations
+ 
+ import uuid
+ from datetime import datetime
+-from typing import Any
++from typing import Any, Literal
+ 
+ from pydantic import BaseModel, ConfigDict, Field
+ 
+@@ -160,6 +160,13 @@ class EditCVRequest(BaseModel):
+     message: str = Field(min_length=1, max_length=5000, description="Edit request")
+ 
+ 
++class EditCVClarification(BaseModel):
++    """Clarification requested before creating a new CV version."""
++
++    needs_clarification: Literal[True] = True
++    clarification_question: str
++
++
+ class SetCVStatusRequest(BaseModel):
+     """Request body for accepting or rejecting a CV version."""
+ 
+@@ -185,6 +192,7 @@ __all__ = [
+     "TailoredCVListResponse",
+     "GenerateCVRequest",
+     "EditCVRequest",
++    "EditCVClarification",
+     "SetCVStatusRequest",
+     "RevertCVRequest",
+ ]
+diff --git a/backend/services/tailoring_generation_service.py b/backend/services/tailoring_generation_service.py
+index d12e55d..2b31066 100644
+--- a/backend/services/tailoring_generation_service.py
++++ b/backend/services/tailoring_generation_service.py
+@@ -17,6 +17,8 @@ from __future__ import annotations
+ 
+ import logging
+ import uuid
++from copy import deepcopy
++from typing import Any
+ 
+ from backend.ai.cv_editor import CVEditorError, CVEditorService
+ from backend.ai.cv_rewriter import CVRewriterError, CVRewriterService
+@@ -136,7 +138,7 @@ class TailoringGenerationService(BaseService[TailoredCVRepository]):
+         self,
+         user_id: uuid.UUID,
+         edit_request: str,
+-    ) -> TailoredCV:
++    ) -> TailoredCV | dict[str, Any]:
+         """Apply a conversational edit to the latest tailored CV.
+ 
+         Args:
+@@ -171,6 +173,24 @@ class TailoringGenerationService(BaseService[TailoredCVRepository]):
+             logger.exception("CV edit failed for user %s", user_id)
+             raise TailoringGenerationError(f"CV edit failed: {exc}") from exc
+ 
++        if edited.get("needs_clarification"):
++            return edited
++
++        explanation_by_index = {
++            entry["section_index"]: entry["explanation"].strip()
++            for entry in edited.pop("section_explanations", [])
++        }
++        edited.pop("needs_clarification", None)
++        edited.pop("clarification_question", None)
++        edited["comparison"] = self.build_comparison(
++            latest.content.get("sections", []),
++            edited.get("sections", []),
++            explanation_by_index,
++            fallback_explanation=(
++                f"Change made in response to: {edit_request.strip()}"
++            ),
++        )
++
+         max_version = await self.repository.get_max_version_number(user_id)
+         version_number = max_version + 1
+ 
+@@ -188,6 +208,122 @@ class TailoringGenerationService(BaseService[TailoredCVRepository]):
+ 
+         return await self.repository.get_by(id=cv_record.id) or cv_record
+ 
++    @staticmethod
++    def build_comparison(
++        before_sections: list[Any],
++        after_sections: list[Any],
++        explanation_by_index: dict[int, str],
++        *,
++        fallback_explanation: str,
++    ) -> list[dict[str, Any]]:
++        """Describe changes by matching sections, not by their current position."""
++        def identity(section: Any) -> tuple[str, str]:
++            if not isinstance(section, dict):
++                return ("", "")
++            return (
++                str(section.get("heading") or "").strip().casefold(),
++                str(section.get("type") or "").strip().casefold(),
++            )
++
++        before_by_identity: dict[tuple[str, str], list[int]] = {}
++        for index, section in enumerate(before_sections):
++            before_by_identity.setdefault(identity(section), []).append(index)
++
++        after_to_before: dict[int, int] = {}
++        unmatched_after = []
++        matched_before: set[int] = set()
++        for after_index, section in enumerate(after_sections):
++            candidates = before_by_identity.get(identity(section), [])
++            before_index = next(
++                (candidate for candidate in candidates if candidate not in matched_before),
++                None,
++            )
++            if before_index is None:
++                unmatched_after.append(after_index)
++            else:
++                after_to_before[after_index] = before_index
++                matched_before.add(before_index)
++
++        # A renamed heading can still be matched when its section type is unique.
++        for after_index in unmatched_after[:]:
++            after_section = after_sections[after_index]
++            after_type = (
++                str(after_section.get("type") or "").strip().casefold()
++                if isinstance(after_section, dict)
++                else ""
++            )
++            candidates = [
++                index
++                for index, section in enumerate(before_sections)
++                if index not in matched_before
++                and isinstance(section, dict)
++                and str(section.get("type") or "").strip().casefold() == after_type
++            ]
++            remaining_after = [
++                index
++                for index in unmatched_after
++                if isinstance(after_sections[index], dict)
++                and str(after_sections[index].get("type") or "").strip().casefold()
++                == after_type
++            ]
++            if after_type and len(candidates) == 1 and len(remaining_after) == 1:
++                before_index = candidates[0]
++                after_to_before[after_index] = before_index
++                matched_before.add(before_index)
++                unmatched_after.remove(after_index)
++
++        comparison = []
++        for after_index, after in enumerate(after_sections):
++            before_index = after_to_before.get(after_index)
++            before = before_sections[before_index] if before_index is not None else None
++            moved = before_index is not None and before_index != after_index
++            status = (
++                "added" if before is None else
++                "changed" if before != after or moved else
++                "unchanged"
++            )
++            section = after if isinstance(after, dict) else {}
++            entry = {
++                "section_index": after_index,
++                "heading": section.get("heading") or section.get("type") or "Section",
++                "status": status,
++                "before": deepcopy(before),
++                "after": deepcopy(after),
++            }
++            if before_index is not None:
++                entry["before_index"] = before_index
++            if moved:
++                entry["position_changed"] = True
++            if status != "unchanged":
++                entry["explanation"] = (
++                    explanation_by_index.get(after_index)
++                    or (
++                        "Section position changed as part of this edit."
++                        if moved and before == after
++                        else fallback_explanation
++                    )
++                    or "Changed in response to the requested CV edit."
++                )
++            comparison.append(entry)
++
++        for before_index, before in enumerate(before_sections):
++            if before_index in matched_before:
++                continue
++            section = before if isinstance(before, dict) else {}
++            comparison.append(
++                {
++                    "section_index": before_index,
++                    "heading": section.get("heading") or section.get("type") or "Section",
++                    "status": "removed",
++                    "before": deepcopy(before),
++                    "after": None,
++                    "before_index": before_index,
++                    "explanation": fallback_explanation
++                    or "Section removed in response to the requested CV edit.",
++                }
++            )
++        return comparison
++
+     async def get_latest_for_user(self, user_id: uuid.UUID) -> TailoredCV | None:
+         """Return the user's most recent tailored CV version."""
+         return await self.repository.get_latest_for_user(user_id)
+@@ -275,13 +411,14 @@ class TailoringGenerationService(BaseService[TailoredCVRepository]):
+ 
+         max_version = await self.repository.get_max_version_number(user_id)
+         new_version = max_version + 1
++        reverted_content = deepcopy(target.content)
+ 
+         cv_record = await self.repository.create(
+             user_id=user_id,
+             analysis_id=target.analysis_id,
+             version_number=new_version,
+             status="pending",
+-            content=target.content,
++            content=reverted_content,
+             edit_type="revert",
+             edit_request=f"Revert to version {version_number}",
+             change_summary=f"Reverted to version {version_number}.",
+diff --git a/tests/test_tailoring_phase3.py b/tests/test_tailoring_phase3.py
+index c1e098c..e0c061a 100644
+--- a/tests/test_tailoring_phase3.py
++++ b/tests/test_tailoring_phase3.py
+@@ -9,6 +9,7 @@ from __future__ import annotations
+ 
+ import io
+ import uuid
++from copy import deepcopy
+ from unittest.mock import AsyncMock, patch
+ 
+ import pytest
+@@ -235,6 +236,56 @@ class TestGetTailoredCV:
+         r = client.get(TAILORED_LATEST_URL, headers=_auth_header(token))
+         assert r.status_code == 404
+ 
++    def test_preview_historical_version_is_read_only_and_compared(
++        self, client: TestClient
++    ) -> None:
++        token = _register_and_login(client)
++        _setup_full_pipeline(client, token)
++        with patch(_PATCH_REWRITER, new=AsyncMock(return_value=_MOCK_REWRITTEN_CV)):
++            initial = client.post(
++                GENERATE_URL, headers=_auth_header(token), json={}
++            ).json()
++        with patch(_PATCH_EDITOR, new=AsyncMock(return_value=_MOCK_EDITED_CV)):
++            client.post(
++                EDIT_URL,
++                headers=_auth_header(token),
++                json={"message": "Emphasise microservices"},
++            )
++
++        preview = client.get(
++            f"/api/v1/tailoring/cv/{initial['id']}", headers=_auth_header(token)
++        )
++        assert preview.status_code == 200
++        data = preview.json()
++        assert data["version_number"] == 1
++        assert data["content"]["sections"] == _MOCK_REWRITTEN_CV["sections"]
++        comparison = {
++            entry["heading"]: entry for entry in data["content"]["comparison"]
++        }
++        assert comparison["Professional Summary"]["status"] == "changed"
++        assert comparison["Professional Summary"]["before"] == (
++            _MOCK_EDITED_CV["sections"][1]
++        )
++        assert comparison["Professional Summary"]["after"] == (
++            _MOCK_REWRITTEN_CV["sections"][1]
++        )
++        assert comparison["Education"]["status"] == "unchanged"
++
++        latest = client.get(TAILORED_LATEST_URL, headers=_auth_header(token)).json()
++        versions = client.get(VERSIONS_URL, headers=_auth_header(token)).json()
++        assert latest["version_number"] == 2
++        assert versions["total"] == 2
++
++    def test_preview_requires_authentication(self, client: TestClient) -> None:
++        token = _register_and_login(client)
++        _setup_full_pipeline(client, token)
++        with patch(_PATCH_REWRITER, new=AsyncMock(return_value=_MOCK_REWRITTEN_CV)):
++            cv = client.post(
++                GENERATE_URL, headers=_auth_header(token), json={}
++            ).json()
++        response = client.get(f"/api/v1/tailoring/cv/{cv['id']}")
++        assert response.status_code in (401, 403)
++
+     def test_cross_user_access_blocked(self, client: TestClient) -> None:
+         token1 = _register_and_login(client)
+         _setup_full_pipeline(client, token1)
+@@ -250,6 +301,146 @@ class TestGetTailoredCV:
+ class TestConversationalEdit:
+     """Tests for POST /tailoring/cv/edit."""
+ 
++    def test_section_edit_preserves_unrelated_sections(self, client: TestClient) -> None:
++        token = _register_and_login(client)
++        _setup_full_pipeline(client, token)
++        with patch(_PATCH_REWRITER, new=AsyncMock(return_value=_MOCK_REWRITTEN_CV)):
++            client.post(GENERATE_URL, headers=_auth_header(token), json={})
++
++        model_response = deepcopy(_MOCK_EDITED_CV)
++        model_response["sections"][3]["items"].append("Unrequested skill")
++        model_response["sections"][4]["items"] = ["Changed education"]
++        model_response["section_explanations"] = [
++            {
++                "section_index": 1,
++                "explanation": "The request asked to target the platform engineering role.",
++            }
++        ]
++        editor = AsyncMock(return_value=model_response)
++        with patch("backend.ai.cv_editor.generate_json", new=editor):
++            response = client.post(
++                EDIT_URL,
++                headers=_auth_header(token),
++                json={"message": "Rewrite my summary for a platform engineering role"},
++            )
++
++        assert response.status_code == 201, response.text
++        sections = response.json()["content"]["sections"]
++        assert sections[1]["content"] == model_response["sections"][1]["content"]
++        assert sections[3] == _MOCK_REWRITTEN_CV["sections"][3]
++        assert sections[4] == _MOCK_REWRITTEN_CV["sections"][4]
++        comparison = response.json()["content"]["comparison"]
++        assert comparison[1]["status"] == "changed"
++        assert comparison[1]["before"] == _MOCK_REWRITTEN_CV["sections"][1]
++        assert comparison[1]["after"] == sections[1]
++        assert comparison[1]["explanation"] == (
++            "The request asked to target the platform engineering role."
++        )
++        assert all(
++            comparison[index]["status"] == "unchanged"
++            for index in (0, 2, 3, 4)
++        )
++        prompt = editor.await_args.args[0]
++        assert "Only section index 1" in prompt
++
++    def test_edit_clarification_does_not_create_version(self, client: TestClient) -> None:
++        token = _register_and_login(client)
++        _setup_full_pipeline(client, token)
++        with patch(_PATCH_REWRITER, new=AsyncMock(return_value=_MOCK_REWRITTEN_CV)):
++            client.post(GENERATE_URL, headers=_auth_header(token), json={})
++
++        clarification = {
++            "sections": [],
++            "edit_summary": "",
++            "needs_clarification": True,
++            "clarification_question": "How many years of Kubernetes experience do you have?",
++        }
++        with patch(
++            "backend.ai.cv_editor.generate_json",
++            new=AsyncMock(return_value=clarification),
++        ):
++            response = client.post(
++                EDIT_URL,
++                headers=_auth_header(token),
++                json={"message": "Add my Kubernetes experience to the skills section"},
++            )
++
++        assert response.status_code == 200, response.text
++        assert response.json() == {
++            "needs_clarification": True,
++            "clarification_question": clarification["clarification_question"],
++        }
++        versions = client.get(VERSIONS_URL, headers=_auth_header(token)).json()
++        assert versions["total"] == 1
++        assert versions["items"][0]["version_number"] == 1
++
++    def test_unscoped_request_keeps_whole_cv_edit_compatibility(
++        self, client: TestClient
++    ) -> None:
++        token = _register_and_login(client)
++        _setup_full_pipeline(client, token)
++        with patch(_PATCH_REWRITER, new=AsyncMock(return_value=_MOCK_REWRITTEN_CV)):
++            client.post(GENERATE_URL, headers=_auth_header(token), json={})
++
++        model_response = deepcopy(_MOCK_EDITED_CV)
++        model_response["sections"] = [
++            model_response["sections"][0],
++            model_response["sections"][2],
++            model_response["sections"][1],
++            model_response["sections"][3],
++            model_response["sections"][4],
++        ]
++        model_response["section_explanations"] = [
++            {
++                "section_index": 2,
++                "explanation": "This follows the request to emphasize the existing experience.",
++            },
++            {
++                "section_index": 3,
++                "explanation": "Microservices is supported by the existing experience entry.",
++            },
++        ]
++        editor = AsyncMock(return_value=model_response)
++        with patch("backend.ai.cv_editor.generate_json", new=editor):
++            response = client.post(
++                EDIT_URL,
++                headers=_auth_header(token),
++                json={"message": "Emphasise my microservices experience"},
++            )
++
++        assert response.status_code == 201, response.text
++        sections = response.json()["content"]["sections"]
++        assert sections[2]["content"] == _MOCK_EDITED_CV["sections"][1]["content"]
++        assert sections[3]["items"] == _MOCK_EDITED_CV["sections"][3]["items"]
++        comparison = response.json()["content"]["comparison"]
++        assert [entry["status"] for entry in comparison] == [
++            "unchanged",
++            "changed",
++            "changed",
++            "changed",
++            "unchanged",
++        ]
++        comparison_by_heading = {entry["heading"]: entry for entry in comparison}
++        assert comparison_by_heading["Professional Summary"]["before"] == (
++            _MOCK_REWRITTEN_CV["sections"][1]
++        )
++        assert comparison_by_heading["Professional Summary"]["after"] == sections[2]
++        assert comparison_by_heading["Professional Summary"]["explanation"] == (
++            "This follows the request to emphasize the existing experience."
++        )
++        assert comparison_by_heading["Experience"]["status"] == "changed"
++        assert comparison_by_heading["Experience"]["before"] == (
++            _MOCK_REWRITTEN_CV["sections"][2]
++        )
++        assert comparison_by_heading["Experience"]["after"] == sections[1]
++        assert comparison_by_heading["Experience"]["explanation"] == (
++            "Section position changed as part of this edit."
++        )
++        assert comparison_by_heading["Skills"]["explanation"] == (
++            "Microservices is supported by the existing experience entry."
++        )
++        assert "Only section index" not in editor.await_args.args[0]
++
+     def test_edit_creates_new_version(self, client: TestClient) -> None:
+         token = _register_and_login(client)
+         _setup_full_pipeline(client, token)
+@@ -348,13 +539,27 @@ class TestRevert:
+             client.post(EDIT_URL, headers=_auth_header(token),
+                         json={"message": "Add microservices"})
+ 
+-        r = client.post(REVERT_URL, headers=_auth_header(token),
+-                        json={"version_number": 1})
++        editor = AsyncMock()
++        with patch(_PATCH_EDITOR, new=editor):
++            r = client.post(REVERT_URL, headers=_auth_header(token),
++                            json={"version_number": 1})
+         assert r.status_code == 201, r.text
+         data = r.json()
+         assert data["version_number"] == 3
+         assert data["edit_type"] == "revert"
+         assert data["change_summary"] == "Reverted to version 1."
++        assert data["content"]["sections"] == _MOCK_REWRITTEN_CV["sections"]
++        assert data["content"]["generation_notes"] == _MOCK_REWRITTEN_CV["generation_notes"]
++        editor.assert_not_awaited()
++        comparison = data["content"]["comparison"]
++        assert comparison[1]["status"] == "changed"
++        assert comparison[1]["before"] == _MOCK_EDITED_CV["sections"][1]
++        assert comparison[1]["after"] == _MOCK_REWRITTEN_CV["sections"][1]
++        assert comparison[1]["explanation"] == "Restored from version 1."
++        versions = client.get(VERSIONS_URL, headers=_auth_header(token)).json()
++        assert versions["total"] == 3
++        initial = next(item for item in versions["items"] if item["version_number"] == 1)
++        assert initial["content"] == _MOCK_REWRITTEN_CV
+ 
+     def test_revert_nonexistent_version(self, client: TestClient) -> None:
+         token = _register_and_login(client)
