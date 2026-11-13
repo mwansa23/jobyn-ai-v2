@@ -22,6 +22,7 @@ from sqlalchemy.exc import IntegrityError
 
 from backend.auth.jwt import InvalidTokenError, create_access_token
 from backend.auth.password import hash_password, verify_password
+from backend.auth.supabase import fetch_supabase_user
 from backend.core.config import settings
 from backend.models.user import User
 from backend.repositories.user import UserRepository
@@ -192,7 +193,11 @@ class AuthService(BaseService[UserRepository]):
 
         return user
 
-    async def resolve_supabase_user(self, claims: dict[str, Any]) -> User:
+    async def resolve_supabase_user(
+        self,
+        claims: dict[str, Any],
+        access_token: str,
+    ) -> User:
         """Resolve or provision the Jobyn account for a verified Supabase token.
 
         Existing mappings take precedence. An unmapped identity may link only
@@ -209,12 +214,30 @@ class AuthService(BaseService[UserRepository]):
         if user is not None:
             return user
 
-        raw_email = claims.get("email")
-        if claims.get("email_verified") is not True:
+        claim_email = claims.get("email")
+        if not isinstance(claim_email, str) or not claim_email.strip():
             raise InvalidTokenError(detail="A verified Supabase email is required.")
-        if not isinstance(raw_email, str) or not raw_email.strip():
+
+        supabase_user = await fetch_supabase_user(access_token)
+        try:
+            authenticated_user_id = UUID(supabase_user.get("id"))
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise InvalidTokenError(detail="Invalid Supabase user identity.") from exc
+        if authenticated_user_id != supabase_user_id:
+            raise InvalidTokenError(detail="Invalid Supabase user identity.")
+
+        verified_email = supabase_user.get("email")
+        if (
+            not isinstance(verified_email, str)
+            or not verified_email.strip()
+            or _normalize_email(verified_email) != _normalize_email(claim_email)
+        ):
+            raise InvalidTokenError(detail="Invalid Supabase user email.")
+        if not isinstance(supabase_user.get("email_confirmed_at"), str) or not (
+            supabase_user["email_confirmed_at"].strip()
+        ):
             raise InvalidTokenError(detail="A verified Supabase email is required.")
-        email = _normalize_email(raw_email)
+        email = _normalize_email(verified_email)
 
         candidates = await self.user_repository.get_email_link_candidates(email)
         if len(candidates) > 1:

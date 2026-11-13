@@ -60,6 +60,7 @@ class Settings(BaseSettings):
     # Supabase project URL is public; the JWT secret is needed only for legacy HS256 projects.
     SUPABASE_URL: str | None = None
     SUPABASE_JWT_SECRET: SecretStr | None = None
+    SUPABASE_PUBLISHABLE_KEY: SecretStr | None = None
 
     # Comma-separated administrator email addresses. Empty means no admin access.
     ADMIN_EMAILS: str | list[str] = Field(default_factory=list)

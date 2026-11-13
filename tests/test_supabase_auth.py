@@ -33,6 +33,7 @@ from backend.services.auth import (
 from backend.services.user import UserService
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -60,11 +61,36 @@ def mocked_jwks(
     settings = get_settings()
     monkeypatch.setattr(settings, "SUPABASE_URL", _PROJECT_URL)
     monkeypatch.setattr(settings, "SUPABASE_JWT_SECRET", None)
+    monkeypatch.setattr(
+        settings,
+        "SUPABASE_PUBLISHABLE_KEY",
+        SecretStr("unit-test-publishable-key"),
+    )
     supabase_auth._JWKS_CACHE.clear()
 
     def handle_jwks(request: httpx.Request) -> httpx.Response:
-        assert str(request.url) == f"{_ISSUER}/.well-known/jwks.json"
-        return httpx.Response(200, json={"keys": [public_jwk]})
+        if str(request.url) == f"{_ISSUER}/.well-known/jwks.json":
+            return httpx.Response(200, json={"keys": [public_jwk]})
+
+        assert str(request.url) == f"{_ISSUER}/user"
+        assert request.headers["apikey"] == "unit-test-publishable-key"
+        access_token = request.headers["authorization"].removeprefix("Bearer ")
+        claims = jwt.decode(
+            access_token,
+            options={
+                "verify_signature": False,
+                "verify_exp": False,
+                "verify_aud": False,
+            },
+        )
+        return httpx.Response(
+            200,
+            json={
+                "id": claims["sub"],
+                "email": claims.get("email"),
+                "email_confirmed_at": "2026-01-01T00:00:00Z",
+            },
+        )
 
     transport = httpx.MockTransport(handle_jwks)
     original_async_client = httpx.AsyncClient
@@ -75,6 +101,45 @@ def mocked_jwks(
     monkeypatch.setattr(supabase_auth.httpx, "AsyncClient", mock_async_client)
     yield
     supabase_auth._JWKS_CACHE.clear()
+
+
+@pytest.fixture
+def mocked_supabase_auth_api(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    settings = get_settings()
+    monkeypatch.setattr(settings, "SUPABASE_URL", _PROJECT_URL)
+    monkeypatch.setattr(
+        settings,
+        "SUPABASE_PUBLISHABLE_KEY",
+        SecretStr("unit-test-publishable-key"),
+    )
+    mock: dict[str, Any] = {
+        "status_code": 200,
+        "payload": {},
+        "network_error": False,
+        "requests": [],
+    }
+
+    def handle_auth_user(request: httpx.Request) -> httpx.Response:
+        mock["requests"].append(request)
+        assert str(request.url) == f"{_ISSUER}/user"
+        assert request.headers["apikey"] == "unit-test-publishable-key"
+        assert request.headers["authorization"].startswith("Bearer ")
+        if mock["network_error"]:
+            raise httpx.ConnectError("Mock Supabase network failure", request=request)
+        return httpx.Response(
+            mock["status_code"],
+            json=mock["payload"],
+        )
+
+    original_async_client = httpx.AsyncClient
+    transport = httpx.MockTransport(handle_auth_user)
+
+    def mock_async_client(*, timeout: float) -> httpx.AsyncClient:
+        assert timeout == 5.0
+        return original_async_client(transport=transport, timeout=timeout)
+
+    monkeypatch.setattr(supabase_auth.httpx, "AsyncClient", mock_async_client)
+    return mock
 
 
 def _claims(subject: uuid.UUID | None = None, **overrides: Any) -> dict[str, Any]:
@@ -105,6 +170,23 @@ def _token(
         algorithm=algorithm,
         headers={"kid": kid},
     )
+
+
+def _mock_access_token(claims: dict[str, Any]) -> str:
+    return jwt.encode(claims, _HS_SECRET, algorithm="HS256")
+
+
+def _mock_supabase_user(
+    mock: dict[str, Any],
+    claims: dict[str, Any],
+    **overrides: Any,
+) -> None:
+    mock["payload"] = {
+        "id": claims["sub"],
+        "email": claims.get("email"),
+        "email_confirmed_at": "2026-01-01T00:00:00Z",
+        **overrides,
+    }
 
 
 @pytest.mark.asyncio
@@ -195,6 +277,7 @@ async def test_supabase_hs256_token_uses_only_configured_supabase_secret(
 @pytest.mark.asyncio
 async def test_existing_jobyn_account_is_linked_without_changing_primary_key_or_data(
     db_session: AsyncSession,
+    mocked_supabase_auth_api: dict[str, Any],
 ) -> None:
     jobyn_id = uuid.uuid4()
     user = User(
@@ -215,8 +298,14 @@ async def test_existing_jobyn_account_is_linked_without_changing_primary_key_or_
         app_metadata={"role": "admin"},
         user_metadata={"role": "admin"},
     )
-    resolved = await AuthService(UserRepository(db_session, User)).resolve_supabase_user(claims)
+    claims.pop("email_verified")
+    _mock_supabase_user(mocked_supabase_auth_api, claims)
+    resolved = await AuthService(UserRepository(db_session, User)).resolve_supabase_user(
+        claims,
+        _mock_access_token(claims),
+    )
 
+    assert "email_verified" not in claims
     assert resolved.id == jobyn_id
     assert resolved.supabase_user_id == uuid.UUID(claims["sub"])
     assert resolved.full_name == "Legacy User"
@@ -230,6 +319,7 @@ async def test_existing_jobyn_account_is_linked_without_changing_primary_key_or_
 @pytest.mark.asyncio
 async def test_existing_supabase_mapping_resolves_without_email_claims(
     db_session: AsyncSession,
+    mocked_supabase_auth_api: dict[str, Any],
 ) -> None:
     supabase_id = uuid.uuid4()
     user = User(
@@ -244,15 +334,18 @@ async def test_existing_supabase_mapping_resolves_without_email_claims(
     await db_session.commit()
 
     resolved = await AuthService(UserRepository(db_session, User)).resolve_supabase_user(
-        {"sub": str(supabase_id)}
+        {"sub": str(supabase_id)},
+        "unused-access-token",
     )
 
     assert resolved.id == user.id
+    assert mocked_supabase_auth_api["requests"] == []
 
 
 @pytest.mark.asyncio
 async def test_verified_new_identity_is_provisioned_as_passwordless_user(
     db_session: AsyncSession,
+    mocked_supabase_auth_api: dict[str, Any],
 ) -> None:
     claims = _claims(
         email="new@example.com",
@@ -260,9 +353,18 @@ async def test_verified_new_identity_is_provisioned_as_passwordless_user(
         user_metadata={"role": "admin"},
         role="admin",
     )
+    _mock_supabase_user(mocked_supabase_auth_api, claims)
+    access_token = _mock_access_token(claims)
 
-    user = await AuthService(UserRepository(db_session, User)).resolve_supabase_user(claims)
+    user = await AuthService(UserRepository(db_session, User)).resolve_supabase_user(
+        claims,
+        access_token,
+    )
 
+    assert (
+        mocked_supabase_auth_api["requests"][0].headers["authorization"]
+        == f"Bearer {access_token}"
+    )
     assert user.supabase_user_id == uuid.UUID(claims["sub"])
     assert user.email == "new@example.com"
     assert user.hashed_password is None
@@ -274,19 +376,88 @@ async def test_verified_new_identity_is_provisioned_as_passwordless_user(
 @pytest.mark.asyncio
 async def test_unverified_supabase_email_is_rejected_without_provisioning(
     db_session: AsyncSession,
+    mocked_supabase_auth_api: dict[str, Any],
 ) -> None:
-    claims = _claims(email="unverified@example.com", email_verified=False)
+    claims = _claims(email="unverified@example.com")
+    _mock_supabase_user(mocked_supabase_auth_api, claims, email_confirmed_at=None)
     service = AuthService(UserRepository(db_session, User))
 
     with pytest.raises(InvalidTokenError, match="verified"):
-        await service.resolve_supabase_user(claims)
+        await service.resolve_supabase_user(claims, _mock_access_token(claims))
+
+    assert await service.user_repository.count() == 0
+
+
+@pytest.mark.parametrize(
+    ("user_overrides", "error"),
+    [
+        ({"id": str(uuid.uuid4())}, "identity"),
+        ({"email": "other@example.com"}, "email"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_supabase_auth_user_must_match_jwt_identity_and_email(
+    db_session: AsyncSession,
+    mocked_supabase_auth_api: dict[str, Any],
+    user_overrides: dict[str, str],
+    error: str,
+) -> None:
+    claims = _claims(email="match@example.com")
+    _mock_supabase_user(mocked_supabase_auth_api, claims, **user_overrides)
+    service = AuthService(UserRepository(db_session, User))
+
+    with pytest.raises(InvalidTokenError, match=error):
+        await service.resolve_supabase_user(claims, _mock_access_token(claims))
 
     assert await service.user_repository.count() == 0
 
 
 @pytest.mark.asyncio
+async def test_missing_supabase_publishable_key_fails_safely(
+    monkeypatch: pytest.MonkeyPatch,
+    mocked_supabase_auth_api: dict[str, Any],
+) -> None:
+    monkeypatch.setattr(get_settings(), "SUPABASE_PUBLISHABLE_KEY", None)
+
+    with pytest.raises(supabase_auth.SupabaseVerificationUnavailable):
+        await supabase_auth.fetch_supabase_user("unit-test-access-token")
+
+    assert mocked_supabase_auth_api["requests"] == []
+
+
+@pytest.mark.parametrize(
+    ("status_code", "network_error"),
+    [(200, True), (503, False)],
+)
+@pytest.mark.asyncio
+async def test_supabase_auth_api_failures_are_reported_as_unavailable(
+    mocked_supabase_auth_api: dict[str, Any],
+    status_code: int,
+    network_error: bool,
+) -> None:
+    mocked_supabase_auth_api["status_code"] = status_code
+    mocked_supabase_auth_api["network_error"] = network_error
+
+    with pytest.raises(supabase_auth.SupabaseVerificationUnavailable):
+        await supabase_auth.fetch_supabase_user("unit-test-access-token")
+
+    assert len(mocked_supabase_auth_api["requests"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_supabase_auth_api_rejects_invalid_access_tokens(
+    mocked_supabase_auth_api: dict[str, Any],
+) -> None:
+    mocked_supabase_auth_api["status_code"] = 401
+
+    with pytest.raises(InvalidTokenError):
+        await supabase_auth.fetch_supabase_user("unit-test-access-token")
+
+
+@pytest.mark.asyncio
 async def test_duplicate_email_identity_requires_manual_resolution(
     db_session: AsyncSession,
+    mocked_supabase_auth_api: dict[str, Any],
 ) -> None:
     existing = User(
         email="duplicate@example.com",
@@ -300,8 +471,12 @@ async def test_duplicate_email_identity_requires_manual_resolution(
     await db_session.commit()
 
     claims = _claims(email="duplicate@example.com")
+    _mock_supabase_user(mocked_supabase_auth_api, claims)
     with pytest.raises(SupabaseIdentityConflictError):
-        await AuthService(UserRepository(db_session, User)).resolve_supabase_user(claims)
+        await AuthService(UserRepository(db_session, User)).resolve_supabase_user(
+            claims,
+            _mock_access_token(claims),
+        )
 
     assert await db_session.scalar(select(func.count()).select_from(User)) == 1
 
@@ -335,13 +510,16 @@ async def test_duplicate_supabase_uuid_is_rejected_by_database(
 @pytest.mark.asyncio
 async def test_concurrent_provisioning_is_idempotent(
     db_session: AsyncSession,
+    mocked_supabase_auth_api: dict[str, Any],
 ) -> None:
     claims = _claims(email="concurrent@example.com")
+    _mock_supabase_user(mocked_supabase_auth_api, claims)
+    access_token = _mock_access_token(claims)
 
     async def provision() -> User:
         async with async_session_factory() as session:
             service = AuthService(UserRepository(session, User))
-            return await service.resolve_supabase_user(claims)
+            return await service.resolve_supabase_user(claims, access_token)
 
     first, second = await asyncio.gather(provision(), provision())
 

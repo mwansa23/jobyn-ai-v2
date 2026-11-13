@@ -95,6 +95,40 @@ async def _fetch_jwks(url: str) -> dict[str, dict[str, Any]]:
     return keys
 
 
+async def fetch_supabase_user(access_token: str) -> dict[str, Any]:
+    """Fetch the authenticated Supabase user for an access token."""
+    settings = get_settings()
+    issuer, _ = _project_urls()
+    publishable_key = settings.SUPABASE_PUBLISHABLE_KEY
+    if publishable_key is None or not publishable_key.get_secret_value().strip():
+        raise SupabaseVerificationUnavailable()
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(
+                f"{issuer}/user",
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "apikey": publishable_key.get_secret_value(),
+                },
+            )
+    except httpx.HTTPError as exc:
+        raise SupabaseVerificationUnavailable() from exc
+
+    if response.status_code in {401, 403}:
+        raise InvalidTokenError(detail="Invalid Supabase access token.")
+    if not response.is_success:
+        raise SupabaseVerificationUnavailable()
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise SupabaseVerificationUnavailable() from exc
+    if not isinstance(payload, dict):
+        raise SupabaseVerificationUnavailable()
+    return payload
+
+
 async def _jwks_for_key(url: str, kid: str) -> dict[str, Any] | None:
     cached = _JWKS_CACHE.get(url)
     if cached is None or cached[0] <= time.monotonic():

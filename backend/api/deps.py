@@ -74,7 +74,7 @@ async def get_current_user(
     user: User | None
     if has_issuer_claim(token):
         claims = await verify_supabase_access_token(token)
-        user = await auth_service.resolve_supabase_user(claims)
+        user = await auth_service.resolve_supabase_user(claims, token)
     else:
         payload = verify_token(token)
         if payload.get("type") != "access":
