@@ -34,6 +34,7 @@ _ADMIN_HTML = _BASE_DIR / "admin.html"
 # The production Cloudflare Worker hosting the Jobyn frontend.
 _PRODUCTION_FRONTEND_ORIGINS = [
     "https://jobyn-landing-page.mwansamatimba.workers.dev",
+    "https://feature-supabase-auth-integration-jobyn-landing-page.mwansamatimba.workers.dev",
 ]
 
 
