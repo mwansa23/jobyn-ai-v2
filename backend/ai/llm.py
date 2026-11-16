@@ -371,6 +371,7 @@ async def _generate_with_nvidia(
     top_p: float,
     enable_thinking: bool,
     reasoning_budget: int | None,
+    response_format: dict[str, str] | None = None,
 ) -> str:
     """Generate text via NVIDIA NIM with Nemotron-specific parameters."""
     client = _get_nvidia_client()
@@ -404,6 +405,7 @@ async def _generate_with_nvidia(
             max_tokens=max_tokens,
             extra_body=extra_body,
             stream=False,
+            **({"response_format": response_format} if response_format else {}),
         )
     except (APITimeoutError, APIConnectionError, RateLimitError, APIError) as exc:
         _log_provider_failure(
@@ -627,6 +629,7 @@ async def generate_text(
     top_p: float | None = None,
     enable_thinking: bool | None = None,
     reasoning_budget: int | None = None,
+    response_format: dict[str, str] | None = None,
 ) -> str:
     """Generate text using the configured LLM provider.
 
@@ -703,14 +706,20 @@ async def generate_text(
     if reasoning_budget is None:
         reasoning_budget = DEFAULT_REASONING_BUDGET
 
-    return await _generate_with_nvidia(
-        prompt,
+    nvidia_kwargs: dict[str, Any] = dict(
         system_prompt=system_prompt,
         temperature=temperature,
         max_tokens=max_tokens,
         top_p=top_p,
         enable_thinking=enable_thinking,
         reasoning_budget=reasoning_budget,
+    )
+    if response_format is not None:
+        nvidia_kwargs["response_format"] = response_format
+
+    return await _generate_with_nvidia(
+        prompt,
+        **nvidia_kwargs,
     )
 
 
@@ -783,7 +792,12 @@ Requirements:
         temperature=temperature,
         max_tokens=max_tokens,
         top_p=top_p,
-        enable_thinking=enable_thinking,
+        response_format=(
+            {"type": "json_object"}
+            if _active_provider() == "nvidia"
+            else None
+        ),
+        enable_thinking=False,
         reasoning_budget=reasoning_budget,
     )
 

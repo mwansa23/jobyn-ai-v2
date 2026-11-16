@@ -130,7 +130,7 @@ async def test_nvidia_usable_when_freellmapi_not_configured(
 
     async def mock_nvidia(
         prompt, *, system_prompt, temperature, max_tokens, top_p,
-        enable_thinking, reasoning_budget
+        enable_thinking, reasoning_budget, **kwargs
     ):
         nvidia_called.append(True)
         return "NVIDIA response"
@@ -195,7 +195,7 @@ async def test_freellmapi_not_called_when_provider_is_nvidia(
 
     async def mock_nvidia(
         prompt, *, system_prompt, temperature, max_tokens, top_p,
-        enable_thinking, reasoning_budget
+        enable_thinking, reasoning_budget, **kwargs
     ):
         return "ok"
 
@@ -241,6 +241,9 @@ async def test_freellmapi_request_has_no_nvidia_extra_body(
     )
     assert "top_p" not in captured_kwargs, (
         "top_p must NOT be sent to FreeLLMAPI (not universally supported)"
+    )
+    assert "response_format" not in captured_kwargs, (
+        "response_format must NOT be sent to FreeLLMAPI (NVIDIA-specific JSON mode)"
     )
 
     # These standard params must be present.
@@ -512,6 +515,116 @@ def test_get_llm_config_freellmapi(monkeypatch: pytest.MonkeyPatch) -> None:
     assert cfg["freellmapi_api_key_configured"] is True
     # Must not expose the actual key value.
     assert "freellmapi_api_key" not in cfg
+
+
+# ---------------------------------------------------------------------------
+# Test 11: NVIDIA JSON generation passes response_format={"type": "json_object"}
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_nvidia_json_generation_passes_response_format(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """generate_json() with provider=nvidia must pass response_format
+    with type=json_object to the NVIDIA API call."""
+    _configure_provider(monkeypatch, "nvidia")
+
+    captured_kwargs: dict[str, Any] = {}
+
+    async def mock_create(**kwargs: Any) -> MagicMock:
+        captured_kwargs.update(kwargs)
+        return _make_response('{"result": "ok"}')
+
+    fake_completions = MagicMock()
+    fake_completions.create = mock_create
+    fake_chat = MagicMock()
+    fake_chat.completions = fake_completions
+    fake_client = MagicMock()
+    fake_client.chat = fake_chat
+
+    monkeypatch.setattr(llm_module, "_nvidia_client", fake_client)
+
+    await generate_json("Extract the candidate profile.")
+
+    assert "response_format" in captured_kwargs, (
+        "NVIDIA JSON generation must include response_format"
+    )
+    assert captured_kwargs["response_format"] == {"type": "json_object"}, (
+        "response_format must be {'type': 'json_object'} for NVIDIA JSON generation"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 12: NVIDIA structured output disables thinking (enable_thinking=False)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_nvidia_structured_output_disables_thinking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """generate_json() with provider=nvidia must set enable_thinking=False
+    in the extra_body chat_template_kwargs."""
+    _configure_provider(monkeypatch, "nvidia")
+
+    captured_kwargs: dict[str, Any] = {}
+
+    async def mock_create(**kwargs: Any) -> MagicMock:
+        captured_kwargs.update(kwargs)
+        return _make_response('{"result": "ok"}')
+
+    fake_completions = MagicMock()
+    fake_completions.create = mock_create
+    fake_chat = MagicMock()
+    fake_chat.completions = fake_completions
+    fake_client = MagicMock()
+    fake_client.chat = fake_chat
+
+    monkeypatch.setattr(llm_module, "_nvidia_client", fake_client)
+
+    await generate_json("Extract the candidate profile.")
+
+    assert "extra_body" in captured_kwargs, (
+        "NVIDIA request must include extra_body"
+    )
+    extra = captured_kwargs["extra_body"]
+    assert "chat_template_kwargs" in extra
+    assert extra["chat_template_kwargs"]["enable_thinking"] is False, (
+        "enable_thinking must be False for NVIDIA structured-output generation"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 13: Ordinary NVIDIA text generation does NOT send response_format
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_nvidia_text_generation_no_response_format(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """generate_text() with provider=nvidia must NOT include response_format
+    when it was not explicitly supplied."""
+    _configure_provider(monkeypatch, "nvidia")
+
+    captured_kwargs: dict[str, Any] = {}
+
+    async def mock_create(**kwargs: Any) -> MagicMock:
+        captured_kwargs.update(kwargs)
+        return _make_response("plain text response")
+
+    fake_completions = MagicMock()
+    fake_completions.create = mock_create
+    fake_chat = MagicMock()
+    fake_chat.completions = fake_completions
+    fake_client = MagicMock()
+    fake_client.chat = fake_chat
+
+    monkeypatch.setattr(llm_module, "_nvidia_client", fake_client)
+
+    await generate_text("Write a cover letter paragraph.")
+
+    assert "response_format" not in captured_kwargs, (
+        "response_format must NOT be sent for ordinary NVIDIA text generation"
+    )
 
 
 # ---------------------------------------------------------------------------
