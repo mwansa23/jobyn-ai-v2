@@ -736,3 +736,119 @@ class TestRegression:
         r = client.get(ANALYSIS_LATEST_URL, headers=_auth_header(token))
         assert r.status_code == 200
         assert r.json()["jd_analysis"]["job_title"] == "Senior Software Engineer"
+
+
+class TestVisualEdit:
+    """Tests for POST /tailoring/cv/{cv_id}/visual-edit (frontend save path)."""
+
+    _VISUAL_EDIT_SECTIONS = [
+        {"heading": "Contact", "type": "contact",
+         "content": "Jane Smith\njane@example.com\n+260 97 123 4567",
+         "items": [], "source": "original"},
+        {"heading": "Professional Summary", "type": "summary",
+         "content": "Experienced backend engineer with a strong Python foundation, now focusing on platform engineering.",
+         "items": [], "source": "rewritten"},
+        {"heading": "Experience", "type": "experience", "content": "", "items": [
+            {"title": "Senior Developer", "company": "TechCorp (2020-2024)",
+             "details": ["Built Python REST APIs with FastAPI",
+                         "Reduced API latency by 40% through targeted query optimisation"]},
+        ], "source": "rewritten"},
+        {"heading": "Skills", "type": "skills", "content": "",
+         "items": ["Python", "FastAPI", "PostgreSQL"], "source": "rewritten"},
+        {"heading": "Education", "type": "education", "content": "",
+         "items": ["BSc Computer Science, University of Zambia"], "source": "original"},
+    ]
+
+    def test_visual_edit_creates_new_version(self, client: TestClient) -> None:
+        """POST /visual-edit saves candidate-edited sections as a new version."""
+        token = _register_and_login(client)
+        _setup_full_pipeline(client, token)
+
+        with patch(_PATCH_REWRITER, new=AsyncMock(return_value=_MOCK_REWRITTEN_CV)):
+            r = client.post(GENERATE_URL, headers=_auth_header(token), json={})
+        assert r.status_code == 201, r.text
+        cv_id = r.json()["id"]
+        original_summary = r.json()["content"]["sections"][1]["content"]
+
+        # Send the visually edited sections
+        visual_edit_url = f"/api/v1/tailoring/cv/{cv_id}/visual-edit"
+        r = client.post(
+            visual_edit_url,
+            headers=_auth_header(token),
+            json={"sections": self._VISUAL_EDIT_SECTIONS},
+        )
+        assert r.status_code == 201, r.text
+        data = r.json()
+        assert data["version_number"] == 2
+        assert data["edit_type"] == "visual_edit"
+        # Confirm summary was updated
+        new_summary = data["content"]["sections"][1]["content"]
+        assert new_summary != original_summary
+        assert "platform engineering" in new_summary
+
+    def test_visual_edit_preserves_original_version(self, client: TestClient) -> None:
+        """After a visual edit, version 1 must still be retrievable."""
+        token = _register_and_login(client)
+        _setup_full_pipeline(client, token)
+
+        with patch(_PATCH_REWRITER, new=AsyncMock(return_value=_MOCK_REWRITTEN_CV)):
+            r = client.post(GENERATE_URL, headers=_auth_header(token), json={})
+        cv_id = r.json()["id"]
+
+        visual_edit_url = f"/api/v1/tailoring/cv/{cv_id}/visual-edit"
+        client.post(visual_edit_url, headers=_auth_header(token),
+                    json={"sections": self._VISUAL_EDIT_SECTIONS})
+
+        # Version list must contain 2 entries
+        r = client.get(VERSIONS_URL, headers=_auth_header(token))
+        assert r.status_code == 200
+        assert r.json()["total"] == 2
+
+        # Latest version is 2; version 1 must still have original summary
+        r = client.get(TAILORED_LATEST_URL, headers=_auth_header(token))
+        assert r.json()["version_number"] == 2
+        v1_summary = _MOCK_REWRITTEN_CV["sections"][1]["content"]  # type: ignore[index]
+        v2_summary = r.json()["content"]["sections"][1]["content"]
+        assert v2_summary != v1_summary  # changed in v2
+
+    def test_visual_edit_requires_auth(self, client: TestClient) -> None:
+        """Unauthenticated visual-edit requests must be rejected."""
+        fake_id = str(uuid.uuid4())
+        r = client.post(
+            f"/api/v1/tailoring/cv/{fake_id}/visual-edit",
+            json={"sections": self._VISUAL_EDIT_SECTIONS},
+        )
+        assert r.status_code in (401, 403)
+
+    def test_visual_edit_cross_user_blocked(self, client: TestClient) -> None:
+        """Another user must not be able to edit another user's CV."""
+        token1 = _register_and_login(client)
+        _setup_full_pipeline(client, token1)
+
+        with patch(_PATCH_REWRITER, new=AsyncMock(return_value=_MOCK_REWRITTEN_CV)):
+            r = client.post(GENERATE_URL, headers=_auth_header(token1), json={})
+        cv_id = r.json()["id"]
+
+        token2 = _register_and_login(client)
+        r = client.post(
+            f"/api/v1/tailoring/cv/{cv_id}/visual-edit",
+            headers=_auth_header(token2),
+            json={"sections": self._VISUAL_EDIT_SECTIONS},
+        )
+        assert r.status_code == 404
+
+    def test_visual_edit_empty_sections_rejected(self, client: TestClient) -> None:
+        """An empty sections list must be rejected (min_length=1)."""
+        token = _register_and_login(client)
+        _setup_full_pipeline(client, token)
+
+        with patch(_PATCH_REWRITER, new=AsyncMock(return_value=_MOCK_REWRITTEN_CV)):
+            r = client.post(GENERATE_URL, headers=_auth_header(token), json={})
+        cv_id = r.json()["id"]
+
+        r = client.post(
+            f"/api/v1/tailoring/cv/{cv_id}/visual-edit",
+            headers=_auth_header(token),
+            json={"sections": []},
+        )
+        assert r.status_code == 422

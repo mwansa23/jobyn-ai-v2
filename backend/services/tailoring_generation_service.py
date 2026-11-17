@@ -27,6 +27,7 @@ from backend.repositories.tailored_cv import TailoredCVRepository
 from backend.repositories.tailoring_analysis import TailoringAnalysisRepository
 from backend.repositories.tailoring import TailoringDocumentRepository
 from backend.services.base import BaseService
+from backend.services.cv_validator import CVValidator
 from backend.services.tailoring_service import TailoringService
 
 logger = logging.getLogger(__name__)
@@ -115,6 +116,23 @@ class TailoringGenerationService(BaseService[TailoredCVRepository]):
         except CVRewriterError as exc:
             logger.exception("CV rewrite failed for user %s", user_id)
             raise TailoringGenerationError(f"CV rewriting failed: {exc}") from exc
+
+        # ── Factual validation (deterministic, no LLM call) ──────────────────
+        try:
+            validation_result = CVValidator.validate(
+                sections=rewritten.get("sections", []),
+                original_cv_text=cv_text,
+            )
+            rewritten["validation"] = validation_result.to_dict()
+        except Exception as exc:  # pragma: no cover — validation must not block generation
+            logger.warning("CV validation raised an unexpected error: %s", exc)
+            rewritten["validation"] = {
+                "is_valid": True,
+                "unsupported_claims": [],
+                "warnings": [],
+                "findings": [],
+                "validation_summary": "Validation skipped due to an internal error.",
+            }
 
         # Determine version number
         max_version = await self.repository.get_max_version_number(user_id)

@@ -3,17 +3,18 @@
 Generates professional, ATS-friendly DOCX and PDF files from the structured
 CV content stored in :class:`TailoredCV`.
 
-Uses ``python-docx`` for DOCX generation and ``reportlab`` for PDF generation.
-Both exports contain the same approved CV content.
+Uses ``python-docx`` for editable DOCX generation and ``reportlab`` for PDF
+generation.  Both formats are built from the same validated structured CV
+representation so their content is always identical.
 
-Format:
-- A4 page size.
-- Clear professional headings.
-- Readable typography (Helvetica/Arial for PDF, Calibri for DOCX).
-- Consistent spacing.
-- Simple section structure.
-- Professional bullet points.
-- No photographs, icons, or graphics.
+Format decisions:
+- A4 page size, 2 cm top/bottom margin, 2.5 cm side margins.
+- Single-column layout — no tables, columns, text boxes, icons, or graphics.
+- Calibri 11pt body for DOCX; Helvetica 11pt body for PDF.
+- Clear section headings (Heading 1 equivalent).
+- Reverse-chronological employment history preserved by the LLM output.
+- Experience entries: bold role title + company line, then indented bullets.
+- No photographs, icons, or decorative elements.
 """
 
 from __future__ import annotations
@@ -47,84 +48,125 @@ def generate_docx(cv_content: dict[str, Any]) -> bytes:
         DocumentExportError: If generation fails.
     """
     from docx import Document
-    from docx.shared import Pt, Cm
+    from docx.shared import Pt, Cm, RGBColor
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
 
     try:
         doc = Document()
 
-        # Page setup: A4
-        for section in doc.sections:
-            section.page_width = Cm(21.0)
-            section.page_height = Cm(29.7)
-            section.top_margin = Cm(2.0)
-            section.bottom_margin = Cm(2.0)
-            section.left_margin = Cm(2.5)
-            section.right_margin = Cm(2.5)
+        # ── Page layout ──────────────────────────────────────────────
+        for sec in doc.sections:
+            sec.page_width = Cm(21.0)
+            sec.page_height = Cm(29.7)
+            sec.top_margin = Cm(2.0)
+            sec.bottom_margin = Cm(2.0)
+            sec.left_margin = Cm(2.5)
+            sec.right_margin = Cm(2.5)
 
-        # Default font
-        style = doc.styles["Normal"]
-        style.font.name = "Calibri"
-        style.font.size = Pt(11)
-        style.paragraph_format.space_after = Pt(4)
+        # ── Default body style ───────────────────────────────────────
+        normal = doc.styles["Normal"]
+        normal.font.name = "Calibri"
+        normal.font.size = Pt(11)
+        normal.paragraph_format.space_after = Pt(2)
+        normal.paragraph_format.space_before = Pt(0)
 
         sections = cv_content.get("sections", [])
+
         for section_data in sections:
-            heading = section_data.get("heading", "")
+            heading = (section_data.get("heading") or "").strip()
             section_type = section_data.get("type", "other")
-            content = section_data.get("content", "")
-            items = section_data.get("items", [])
+            content = (section_data.get("content") or "").strip()
+            items = section_data.get("items") or []
 
-            # Add heading (skip if empty)
+            # ── Section heading ──────────────────────────────────────
             if heading:
-                h = doc.add_heading(heading, level=1)
-                h.style.font.size = Pt(13)
+                h = doc.add_paragraph(heading)
+                h.style = doc.styles["Heading 1"]
+                # Set heading font directly on the run, not on the shared style
+                for run in h.runs:
+                    run.font.name = "Calibri"
+                    run.font.size = Pt(13)
+                    run.font.color.rgb = RGBColor(0x17, 0x17, 0x17)
+                    run.bold = True
+                h.paragraph_format.space_before = Pt(10)
+                h.paragraph_format.space_after = Pt(4)
 
-            # Contact section: just add content as paragraphs
+            # ── Contact section: preserve line breaks ────────────────
             if section_type == "contact":
-                if content:
-                    doc.add_paragraph(content)
+                for line in content.splitlines():
+                    if line.strip():
+                        p = doc.add_paragraph(line.strip())
+                        p.paragraph_format.space_after = Pt(1)
+                # Spacer
+                doc.add_paragraph("")
                 continue
 
-            # Summary section: single paragraph
+            # ── Summary: single block paragraph ─────────────────────
             if section_type == "summary":
                 if content:
                     p = doc.add_paragraph(content)
-                    p.paragraph_format.space_after = Pt(8)
+                    p.paragraph_format.space_after = Pt(6)
+                doc.add_paragraph("")
                 continue
 
-            # List-based sections (experience, skills, education, etc.)
+            # ── List-based sections ──────────────────────────────────
             if items:
                 for item in items:
                     if isinstance(item, str):
-                        doc.add_paragraph(item, style="List Bullet")
-                    elif isinstance(item, dict):
-                        # Item may have title, subtitle, and details
-                        title = item.get("title", item.get("role", item.get("name", "")))
-                        subtitle = item.get("company", item.get("organisation", item.get("institution", "")))
-                        details = item.get("details", item.get("description", item.get("bullets", [])))
+                        p = doc.add_paragraph(item.strip(), style="List Bullet")
+                        p.paragraph_format.space_after = Pt(2)
 
+                    elif isinstance(item, dict):
+                        # Experience / education / certification entry
+                        title = (
+                            item.get("title")
+                            or item.get("role")
+                            or item.get("name")
+                            or ""
+                        ).strip()
+                        subtitle = (
+                            item.get("company")
+                            or item.get("organisation")
+                            or item.get("institution")
+                            or ""
+                        ).strip()
+                        date_str = (item.get("dates") or item.get("date") or "").strip()
+                        details = item.get("details") or item.get("description") or item.get("bullets") or []
+
+                        # Role/company line (bold title, plain subtitle)
                         if title or subtitle:
                             p = doc.add_paragraph()
+                            p.paragraph_format.space_before = Pt(4)
+                            p.paragraph_format.space_after = Pt(1)
                             if title:
                                 run = p.add_run(title)
                                 run.bold = True
                             if subtitle:
-                                if title:
-                                    p.add_run(" — ")
-                                p.add_run(subtitle)
+                                sep = " — " if title else ""
+                                p.add_run(sep + subtitle)
+                            if date_str:
+                                p.add_run(f"  |  {date_str}")
+
+                        # Detail bullets
                         if isinstance(details, list):
                             for d in details:
-                                if isinstance(d, str):
-                                    doc.add_paragraph(d, style="List Bullet")
-                        elif isinstance(details, str) and details:
-                            doc.add_paragraph(details, style="List Bullet")
-                    else:
-                        doc.add_paragraph(str(item), style="List Bullet")
-            elif content:
-                doc.add_paragraph(content)
+                                if isinstance(d, str) and d.strip():
+                                    bp = doc.add_paragraph(d.strip(), style="List Bullet")
+                                    bp.paragraph_format.space_after = Pt(1)
+                        elif isinstance(details, str) and details.strip():
+                            bp = doc.add_paragraph(details.strip(), style="List Bullet")
+                            bp.paragraph_format.space_after = Pt(1)
 
-            # Add spacing after each section
-            doc.add_paragraph("")
+                    else:
+                        p = doc.add_paragraph(str(item), style="List Bullet")
+                        p.paragraph_format.space_after = Pt(2)
+
+            elif content:
+                p = doc.add_paragraph(content)
+                p.paragraph_format.space_after = Pt(4)
+
+            # Section spacer
+            doc.add_paragraph("").paragraph_format.space_after = Pt(2)
 
         buf = io.BytesIO()
         doc.save(buf)
@@ -156,6 +198,7 @@ def generate_pdf(cv_content: dict[str, Any]) -> bytes:
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.units import cm
     from reportlab.lib.enums import TA_LEFT
+    from reportlab.lib.colors import HexColor  # ← fix: use Color object, not string
     from reportlab.platypus import (
         SimpleDocTemplate,
         Paragraph,
@@ -178,15 +221,24 @@ def generate_pdf(cv_content: dict[str, Any]) -> bytes:
 
         styles = getSampleStyleSheet()
 
-        # Custom styles
+        # ── Custom styles ────────────────────────────────────────────
         heading_style = ParagraphStyle(
             "CVHeading",
             parent=styles["Heading1"],
             fontName="Helvetica-Bold",
             fontSize=13,
             spaceBefore=12,
-            spaceAfter=6,
-            textColor="#171717",
+            spaceAfter=4,
+            textColor=HexColor("#171717"),  # ← was bare string; now Color object
+        )
+        subheading_style = ParagraphStyle(
+            "CVSubHeading",
+            parent=styles["Normal"],
+            fontName="Helvetica-Bold",
+            fontSize=11,
+            spaceBefore=4,
+            spaceAfter=1,
+            textColor=HexColor("#171717"),
         )
         body_style = ParagraphStyle(
             "CVBody",
@@ -199,67 +251,112 @@ def generate_pdf(cv_content: dict[str, Any]) -> bytes:
         )
         bullet_style = ParagraphStyle(
             "CVBullet",
-            parent=body_style,
-            leftIndent=18,
-            bulletIndent=6,
+            parent=styles["Normal"],
+            fontName="Helvetica",
+            fontSize=10.5,
+            leading=14,
+            leftIndent=14,
             spaceAfter=2,
+            alignment=TA_LEFT,
         )
 
-        story = []
+        story: list[Any] = []
         sections = cv_content.get("sections", [])
 
         for section_data in sections:
-            heading = section_data.get("heading", "")
+            heading = (section_data.get("heading") or "").strip()
             section_type = section_data.get("type", "other")
-            content = section_data.get("content", "")
-            items = section_data.get("items", [])
+            content = (section_data.get("content") or "").strip()
+            items = section_data.get("items") or []
 
+            # ── Section heading ──────────────────────────────────────
             if heading:
-                story.append(Paragraph(heading, heading_style))
+                story.append(Paragraph(escape(heading), heading_style))
 
+            # ── Contact: preserve line breaks ────────────────────────
             if section_type == "contact":
-                if content:
-                    story.append(Paragraph(content, body_style))
+                for line in content.splitlines():
+                    if line.strip():
+                        story.append(Paragraph(escape(line.strip()), body_style))
                 story.append(Spacer(1, 6))
                 continue
 
+            # ── Summary ──────────────────────────────────────────────
             if section_type == "summary":
                 if content:
-                    story.append(Paragraph(content, body_style))
+                    story.append(Paragraph(escape(content), body_style))
                 story.append(Spacer(1, 8))
                 continue
 
+            # ── List-based sections ──────────────────────────────────
             if items:
-                list_items = []
                 for item in items:
                     if isinstance(item, str):
-                        list_items.append(ListItem(Paragraph(item, bullet_style)))
+                        story.append(Paragraph(f"• {escape(item.strip())}", bullet_style))
+
                     elif isinstance(item, dict):
-                        title = item.get("title", item.get("role", item.get("name", "")))
-                        subtitle = item.get("company", item.get("organisation", item.get("institution", "")))
-                        details = item.get("details", item.get("description", item.get("bullets", [])))
+                        # Experience / education entry
+                        title = (
+                            item.get("title")
+                            or item.get("role")
+                            or item.get("name")
+                            or ""
+                        ).strip()
+                        subtitle = (
+                            item.get("company")
+                            or item.get("organisation")
+                            or item.get("institution")
+                            or ""
+                        ).strip()
+                        date_str = (item.get("dates") or item.get("date") or "").strip()
+                        details = (
+                            item.get("details")
+                            or item.get("description")
+                            or item.get("bullets")
+                            or []
+                        )
 
-                        text_parts = []
+                        # Role + company line rendered as a paragraph, not a list item
+                        # ← fix: was nested in same ListFlowable, losing hierarchy
+                        parts = []
                         if title:
-                            text_parts.append(f"<b>{title}</b>")
+                            parts.append(f"<b>{escape(title)}</b>")
                         if subtitle:
-                            text_parts.append(subtitle)
-                        if text_parts:
-                            list_items.append(ListItem(Paragraph(" — ".join(text_parts), bullet_style)))
+                            parts.append(escape(subtitle))
+                        if date_str:
+                            parts.append(f"<i>{escape(date_str)}</i>")
+                        if parts:
+                            story.append(Paragraph(" — ".join(parts), subheading_style))
 
+                        # Detail bullets as a separate list
+                        bullet_texts: list[str] = []
                         if isinstance(details, list):
-                            for d in details:
-                                if isinstance(d, str):
-                                    list_items.append(ListItem(Paragraph(d, bullet_style)))
-                        elif isinstance(details, str) and details:
-                            list_items.append(ListItem(Paragraph(details, bullet_style)))
-                    else:
-                        list_items.append(ListItem(Paragraph(str(item), bullet_style)))
+                            bullet_texts = [
+                                d for d in details if isinstance(d, str) and d.strip()
+                            ]
+                        elif isinstance(details, str) and details.strip():
+                            bullet_texts = [details.strip()]
 
-                if list_items:
-                    story.append(ListFlowable(list_items, bulletType="bullet", start="•"))
+                        if bullet_texts:
+                            story.append(
+                                ListFlowable(
+                                    [
+                                        ListItem(
+                                            Paragraph(escape(d), bullet_style),
+                                            leftIndent=14,
+                                        )
+                                        for d in bullet_texts
+                                    ],
+                                    bulletType="bullet",
+                                    start="•",
+                                )
+                            )
+
+                    else:
+                        story.append(Paragraph(f"• {escape(str(item))}", bullet_style))
+
             elif content:
-                story.append(Paragraph(content, body_style))
+                story.append(Paragraph(escape(content), body_style))
 
             story.append(Spacer(1, 8))
 
@@ -296,7 +393,7 @@ def generate_cover_letter_pdf(cover_letter: str) -> bytes:
             leading=16,
             spaceAfter=8,
         )
-        story = []
+        story: list[Any] = []
         for paragraph in cover_letter.splitlines():
             if paragraph.strip():
                 story.append(Paragraph(escape(paragraph), body_style))
