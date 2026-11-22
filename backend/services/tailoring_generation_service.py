@@ -63,6 +63,66 @@ class TailoringGenerationService(BaseService[TailoredCVRepository]):
             model=None,  # type: ignore[arg-type]
         )
 
+    async def _resolve_original_cv_text(
+        self,
+        user_id: uuid.UUID,
+        cv_record: TailoredCV | None = None,
+    ) -> str:
+        """Return the original CV text that *cv_record* was generated against.
+
+        Resolves through ``cv_record.analysis_id → TailoringAnalysis.cv_document_id
+        → TailoringDocument``.  This is the document the CV was actually produced
+        from, regardless of whether the user has since uploaded a new CV.
+
+        Returns an empty string when the source document cannot be resolved
+        (missing analysis_id, deleted analysis, deleted document, or empty
+        extracted text).  An empty string causes ``CVValidator.validate()`` to
+        return ``skipped=True``, which the export guard blocks.  This is the
+        fail-closed behaviour: we never silently substitute an unrelated CV.
+        """
+        if cv_record is not None and cv_record.analysis_id is not None:
+            analysis_repo = self._get_analysis_repo()
+            analysis = await analysis_repo.get_by(id=cv_record.analysis_id)
+            if analysis is not None:
+                doc = await self.document_service.get_document_for_user(
+                    analysis.cv_document_id, user_id
+                )
+                if doc is not None:
+                    text = doc.extracted_text or doc.pasted_text or ""
+                    if text.strip():
+                        return text
+        # Source document unavailable — fail closed with empty text.
+        return ""
+
+    def _run_validation(
+        self,
+        content: dict[str, Any],
+        original_cv_text: str,
+    ) -> None:
+        """Run :class:`CVValidator` and embed the result into *content* in-place.
+
+        On success, sets ``content["validation"]`` with ``skipped: False``.
+        On any exception, sets ``content["validation"]`` with ``skipped: True``
+        so callers can distinguish a technical bypass from a genuine clean pass.
+        Never raises.
+        """
+        try:
+            result = CVValidator.validate(
+                sections=content.get("sections", []),
+                original_cv_text=original_cv_text,
+            )
+            content["validation"] = result.to_dict()  # carries skipped from result
+        except Exception as exc:  # pragma: no cover — validation must not block saves
+            logger.warning("CV validation raised an unexpected error: %s", exc)
+            content["validation"] = {
+                "is_valid": True,
+                "skipped": True,
+                "unsupported_claims": [],
+                "warnings": [],
+                "findings": [],
+                "validation_summary": "Validation skipped due to an internal error.",
+            }
+
     async def generate_tailored_cv(self, user_id: uuid.UUID) -> TailoredCV:
         """Generate the initial tailored CV from the user's latest analysis.
 
@@ -105,6 +165,27 @@ class TailoringGenerationService(BaseService[TailoredCVRepository]):
         if not cv_text.strip():
             raise TailoringGenerationError("CV document has no extracted text.")
 
+        # ── Stale-analysis safeguard ──────────────────────────────────────────
+        # Verify that the analysis was run against the *current* CV and JD
+        # documents.  If the user uploaded a new CV or JD after the analysis
+        # was run, the analysis is stale and must not be silently reused.
+        if analysis.cv_document_id != cv_doc.id:
+            raise TailoringGenerationError(
+                "The saved analysis was run against a different CV. "
+                "Please re-run the analysis with the current CV before generating."
+            )
+
+        jd_doc = await self.document_service.get_latest_job_description(user_id)
+        if jd_doc is None:
+            raise TailoringGenerationError(
+                "No job description found. Please upload or paste a JD first."
+            )
+        if analysis.jd_document_id != jd_doc.id:
+            raise TailoringGenerationError(
+                "The saved analysis was run against a different job description. "
+                "Please re-run the analysis with the current JD before generating."
+            )
+
         # Call the CV rewriter
         try:
             rewritten = await self._cv_rewriter.rewrite(
@@ -118,21 +199,10 @@ class TailoringGenerationService(BaseService[TailoredCVRepository]):
             raise TailoringGenerationError(f"CV rewriting failed: {exc}") from exc
 
         # ── Factual validation (deterministic, no LLM call) ──────────────────
-        try:
-            validation_result = CVValidator.validate(
-                sections=rewritten.get("sections", []),
-                original_cv_text=cv_text,
-            )
-            rewritten["validation"] = validation_result.to_dict()
-        except Exception as exc:  # pragma: no cover — validation must not block generation
-            logger.warning("CV validation raised an unexpected error: %s", exc)
-            rewritten["validation"] = {
-                "is_valid": True,
-                "unsupported_claims": [],
-                "warnings": [],
-                "findings": [],
-                "validation_summary": "Validation skipped due to an internal error.",
-            }
+        # cv_text was resolved from cv_doc above and is the correct source
+        # document for this generation, so pass it directly (avoids a redundant
+        # DB round-trip through _resolve_original_cv_text).
+        self._run_validation(rewritten, cv_text)
 
         # Determine version number
         max_version = await self.repository.get_max_version_number(user_id)
@@ -175,11 +245,12 @@ class TailoringGenerationService(BaseService[TailoredCVRepository]):
                 "No tailored CV found. Generate one first."
             )
 
-        # Load original CV text for integrity reference
-        cv_doc = await self.document_service.get_latest_cv(user_id)
-        original_cv_text = ""
-        if cv_doc:
-            original_cv_text = cv_doc.extracted_text or cv_doc.pasted_text or ""
+        # Resolve source text from the analysis that produced the *current*
+        # latest version — not from whatever CV the user may have uploaded
+        # since generation.  This single resolved text is reused for both the
+        # LLM editor context (advisory) and the deterministic validator
+        # (enforcement), ensuring both operate against the same source CV.
+        original_cv_text = await self._resolve_original_cv_text(user_id, latest)
 
         try:
             edited = await self._cv_editor.apply_edit(
@@ -208,6 +279,10 @@ class TailoringGenerationService(BaseService[TailoredCVRepository]):
                 f"Change made in response to: {edit_request.strip()}"
             ),
         )
+
+        # Validate the edited content against the same generation-time source
+        # CV resolved above — no second lookup needed.
+        self._run_validation(edited, original_cv_text)
 
         max_version = await self.repository.get_max_version_number(user_id)
         version_number = max_version + 1
@@ -255,6 +330,12 @@ class TailoringGenerationService(BaseService[TailoredCVRepository]):
             {},
             fallback_explanation="Edited directly by the candidate.",
         )
+
+        # ── F2: Validate the visually edited content against the original ───
+        # Resolve source document from the analysis that produced this CV
+        # version, not from whatever CV has been uploaded most recently.
+        original_cv_text = await self._resolve_original_cv_text(user_id, current)
+        self._run_validation(content, original_cv_text)
 
         version_number = await self.repository.get_max_version_number(user_id) + 1
         cv_record = await self.repository.create(
@@ -481,6 +562,14 @@ class TailoringGenerationService(BaseService[TailoredCVRepository]):
         max_version = await self.repository.get_max_version_number(user_id)
         new_version = max_version + 1
         reverted_content = deepcopy(target.content)
+
+        # ── F6: Revalidate against the original source CV ───────────────────
+        # The old validation result embedded in target.content may be stale —
+        # the user may have uploaded a new CV since target was created.
+        # Resolve source text from the analysis linked to *target*, not from
+        # get_latest_cv(), to compare against the document that produced it.
+        original_cv_text = await self._resolve_original_cv_text(user_id, target)
+        self._run_validation(reverted_content, original_cv_text)
 
         cv_record = await self.repository.create(
             user_id=user_id,

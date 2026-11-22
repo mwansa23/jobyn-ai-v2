@@ -101,6 +101,188 @@ def _present_in(value: str, text: str) -> bool:
     return bool(value.strip()) and value.strip().lower() in text.lower()
 
 
+# Company-name suffixes that are too generic to be used as matching evidence.
+_COMPANY_SUFFIXES = frozenset({
+    "ltd", "limited", "inc", "incorporated", "llc", "plc", "co", "corp",
+    "corporation", "group", "holdings", "services", "solutions", "consulting",
+    "consultants", "associates", "partners", "agency", "enterprises", "company",
+    "international", "global", "africa", "zambia", "lusaka",
+})
+
+
+def _employer_tokens(employer: str) -> set[str]:
+    """Return meaningful lowercase tokens from an employer name.
+
+    Strips generic company-suffix words (Ltd, Limited, Inc, etc.) and common
+    geographic words so that the remaining tokens are name-specific.  Requires
+    tokens of at least 3 characters.
+    """
+    words = re.findall(r"[a-z0-9]+", employer.lower())
+    return {
+        w for w in words
+        if len(w) >= 3 and w not in _COMPANY_SUFFIXES and w not in _tokens("")
+    }
+
+
+def _extract_employer_tokens_from_cv(cv_text: str) -> set[str]:
+    """Return meaningful tokens drawn only from date-bearing lines inside the
+    employment-history section of the original CV.
+
+    Uses :func:`_extract_employment_section_text` to restrict to the employment
+    window, then collects tokens only from lines that contain a 4-digit year
+    (employer/role header lines).  Falls back to all date-bearing lines in the
+    full CV when no employment section heading is found.
+    """
+    employment_text = _extract_employment_section_text(cv_text)
+
+    if employment_text is None:
+        # Headingless CV — fall back to all date-bearing lines in the full text.
+        tokens = set()
+        for line in cv_text.splitlines():
+            stripped = line.strip()
+            if stripped and _YEAR_RE.search(stripped):
+                tokens |= _employer_tokens(stripped)
+        return tokens
+
+    # Employment section text (may be empty if headings exist but no
+    # employment section was found — returns empty token set, which is
+    # correct: no employer evidence should be available).
+    tokens = set()
+    for line in employment_text.splitlines():
+        stripped = line.strip()
+        if stripped and _YEAR_RE.search(stripped):
+            tokens |= _employer_tokens(stripped)
+    return tokens
+
+
+def _extract_employment_section_text(cv_text: str) -> str:
+    """Return only the lines that belong to identifiable employment-history
+    sections of the original CV.
+
+    Uses the same section-heading detection as the token extractor.  Returns
+    an empty string when no employment section heading is found, so callers
+    can fall back to the full text.
+    """
+    # Known employment section headings (case-insensitive match at start of line)
+    _EMPLOYMENT_HEADINGS = re.compile(
+        r"^(professional\s+experience|work\s+experience|employment\s+history"
+        r"|career\s+history|experience)\s*$",
+        re.IGNORECASE,
+    )
+    # Vocabulary of words allowed in non-employment section headings.
+    # A short non-year non-bullet line is treated as a non-employment heading
+    # ONLY if every word it contains is in this set.  This prevents employer
+    # names that happen to start with a heading keyword — e.g. "Training
+    # Solutions International", "Education First", "Skills Academy" — from
+    # being mistaken for section headings, while still recognising real
+    # headings like "EDUCATION", "RELEVANT TRAINING AND CERTIFICATES", and
+    # "PROFESSIONAL DEVELOPMENT".
+    _HEADING_WORDS = frozenset({
+        "education", "educational", "qualifications", "qualification", "academic",
+        "certification", "certifications", "certificates", "certificate",
+        "training", "courses", "course",
+        "professional", "development",
+        "languages", "language",
+        "skills", "skill",
+        "references", "reference",
+        "volunteer", "volunteering",
+        "awards", "award",
+        "publications", "publication",
+        "projects", "project",
+        "summary", "profile", "objective",
+        "competencies", "competency",
+        "interests", "interest",
+        "hobbies", "hobby",
+        "memberships", "membership",
+        "relevant", "additional", "other",
+        "core", "key", "special",
+        "history", "background", "records",
+    })
+    _HEADING_CONNECTORS = frozenset({
+        "and", "the", "of", "for", "&",
+    })
+
+    employment_lines: list[str] = []
+    in_employment_section = False
+    found_any_heading = False
+
+    for line in cv_text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        # Detect section headings: short lines, no year, no bullet marker.
+        is_short = len(stripped) <= 60
+        has_year = bool(_YEAR_RE.search(stripped))
+        is_bullet = stripped[:2] in ("ò ", "• ", "- ", "* ") or stripped.startswith("o ")
+
+        if is_short and not has_year and not is_bullet:
+            # Strip a trailing colon before heading pattern matching — common
+            # in free-form CVs ("Professional Experience:", "Education:").
+            stripped_heading = stripped.rstrip(":").strip()
+            if _EMPLOYMENT_HEADINGS.match(stripped_heading):
+                in_employment_section = True
+                found_any_heading = True
+                continue
+            # Check whether this line is a non-employment section heading.
+            # A line qualifies only if EVERY word is a known heading word or
+            # a common connector.  This prevents employer names like
+            # "Training Solutions International" from closing the window.
+            words = re.findall(r"[a-z0-9&]+", stripped_heading.lower())
+            if words and all(
+                w in _HEADING_WORDS or w in _HEADING_CONNECTORS
+                for w in words
+            ):
+                in_employment_section = False
+                found_any_heading = True
+                continue
+
+        if in_employment_section:
+            employment_lines.append(stripped)
+
+    if not found_any_heading:
+        return None  # headingless CV — caller falls back to full text
+
+    return "\n".join(employment_lines)
+
+
+# ── Placeholder detection ────────────────────────────────────────────────────
+
+# Common placeholder values that LLMs emit when they don't have real data.
+_PLACEHOLDER_PATTERNS = [
+    re.compile(r"^\[?your\s+", re.IGNORECASE),
+    re.compile(r"^job\s*title\s*$", re.IGNORECASE),
+    re.compile(r"^company\s*(name)?\s*$", re.IGNORECASE),
+    re.compile(r"^dates?\s*$", re.IGNORECASE),
+    re.compile(r"^date\s*(range)?\s*$", re.IGNORECASE),
+    re.compile(r"^placeholder", re.IGNORECASE),
+    re.compile(r"^n/?a\s*$", re.IGNORECASE),
+    re.compile(r"^tbd\s*$", re.IGNORECASE),
+    re.compile(r"^lorem\s+ipsum", re.IGNORECASE),
+    re.compile(r"^\[.*\]\s*$"),  # bracket-only text like [Company Name]
+    re.compile(r"^enter\s+your\s+", re.IGNORECASE),
+]
+
+
+def _is_placeholder(value: str) -> bool:
+    """Return True if *value* looks like a placeholder rather than real data."""
+    stripped = value.strip()
+    if not stripped:
+        return True
+    return any(p.search(stripped) for p in _PLACEHOLDER_PATTERNS)
+
+
+# ── Experience-duration claim detection ──────────────────────────────────────
+
+# Matches patterns like "3+ years of experience" or "5 years of paid-search
+# experience" or "3+ years of business development expertise".  Allows a
+# domain keyword (one or more words/hyphens) between "of" and the final noun.
+_DURATION_CLAIM_RE = re.compile(
+    r"\b(\d+\+?\s*(?:years?|months?|yrs?)\s+of\s+[\w\s,-]+?(?:experience|expertise|background))",
+    re.IGNORECASE,
+)
+
+
 # ---------------------------------------------------------------------------
 # Validation result dataclass
 # ---------------------------------------------------------------------------
@@ -111,6 +293,9 @@ class CVValidationResult:
 
     is_valid: bool
     """False when any claim is classified as ``unsupported`` or ``contradicted``."""
+
+    skipped: bool = False
+    """True when validation could not run (empty/unavailable source text)."""
 
     unsupported_claims: list[dict[str, Any]] = field(default_factory=list)
     """Each entry: ``{section, item_index, claim, classification, detail}``."""
@@ -127,6 +312,7 @@ class CVValidationResult:
     def to_dict(self) -> dict[str, Any]:
         return {
             "is_valid": self.is_valid,
+            "skipped": self.skipped,
             "unsupported_claims": self.unsupported_claims,
             "warnings": self.warnings,
             "findings": self.findings,
@@ -171,9 +357,12 @@ class CVValidator:
             :class:`CVValidationResult`.
         """
         if not original_cv_text or not original_cv_text.strip():
-            # No original to compare against — pass with a warning.
+            # No original to compare against — mark as skipped so the export
+            # guard blocks it.  is_valid stays True (nothing was contradicted)
+            # but skipped=True signals that no validation actually ran.
             return CVValidationResult(
                 is_valid=True,
+                skipped=True,
                 validation_summary=(
                     "Original CV text is unavailable; factual validation was skipped."
                 ),
@@ -197,13 +386,13 @@ class CVValidator:
             items = section.get("items") or []
             content = (section.get("content") or "").strip()
 
-            # ── Contact and "original"-sourced sections are trusted ──────────
-            if sec_type == "contact" or source == "original":
+            # ── Contact section is always trusted (name, phone, email) ──────
+            if sec_type == "contact":
                 all_findings.append({
                     "section": sec_heading,
                     "section_index": sec_idx,
                     "classification": "supported",
-                    "detail": "Section preserved verbatim from the original CV.",
+                    "detail": "Contact section preserved from the original CV.",
                 })
                 continue
 
@@ -339,20 +528,63 @@ class CVValidator:
 
         issues: list[str] = []
 
+        # ── Placeholder detection ──────────────────────────────────────────
+        for field_name, field_value in [("title", title), ("employer", employer), ("dates", dates)]:
+            if field_value and _is_placeholder(field_value):
+                return {
+                    "section": section,
+                    "item_index": item_idx,
+                    "claim": f"{field_name}: {field_value!r}",
+                    "classification": "unsupported",
+                    "detail": f"Placeholder value for {field_name} — not real candidate data.",
+                }
+
         # Employer check
-        if employer and not _present_in(employer, orig):
-            # Try partial match (first word of employer name)
-            first_word = employer.split()[0] if employer.split() else ""
-            if first_word and not _present_in(first_word, orig):
+        # When the CV has recognisable employment-section headings, restrict
+        # both the verbatim check and the token fallback to that section's
+        # text.  This prevents an organisation appearing only in Education or
+        # Training from passing as an employer.  For free-form CVs (no
+        # recognised headings), fall back to full-text matching so we don't
+        # break existing behaviour.
+        employment_text = _extract_employment_section_text(orig)
+        # None → headingless CV: fall back to full text for backward compat.
+        # "" → headings found but no employment section: use empty evidence
+        #       (employer claims must not pass against non-employment sections).
+        # Non-empty → employment section text: use it directly.
+        if employment_text is None:
+            employer_evidence_text = orig
+        else:
+            employer_evidence_text = employment_text
+
+        if employer and not _present_in(employer, employer_evidence_text):
+            # Verbatim match in the employment section failed.  Apply a
+            # token-overlap check against employment-section tokens.
+            employer_tokens = _employer_tokens(employer)
+            orig_employer_evidence = _extract_employer_tokens_from_cv(orig)
+            matching_tokens = employer_tokens & orig_employer_evidence
+            # Require at least 2 matching tokens, OR the whole name reduces to a
+            # single meaningful token (e.g. a one-word company name).
+            min_needed = 1 if len(employer_tokens) == 1 else 2
+            if len(matching_tokens) < min_needed:
                 return {
                     "section": section,
                     "item_index": item_idx,
                     "claim": f"Employer: {employer!r}",
                     "classification": "unsupported",
-                    "detail": f"Employer '{employer}' not found in original CV text.",
+                    "detail": (
+                        f"Employer '{employer}' not found in original employment history "
+                        f"(matched {len(matching_tokens)}/{len(employer_tokens)} "
+                        f"meaningful tokens against date-bearing CV lines)."
+                    ),
                 }
             else:
-                issues.append(f"Full employer name '{employer}' not in original; partial match found.")
+                # At least two tokens matched but full name didn't — allow as
+                # a needs_confirmation warning (possible abbreviation / rewording).
+                issues.append(
+                    f"Full employer name '{employer}' not in original; "
+                    f"{len(matching_tokens)} token(s) matched in employment lines: "
+                    f"{matching_tokens}."
+                )
 
         # Title check (soft — rewordings are common)
         if title and not _present_in(title, orig):
@@ -395,6 +627,27 @@ class CVValidator:
                 }
             elif qf["classification"] == "needs_confirmation":
                 issues.append(qf["detail"])
+
+        # ── Duration-claim validation ──────────────────────────────────────
+        # Flag fabricated experience-duration claims like "3+ years of
+        # paid-search experience" that cannot be traced to the original CV.
+        duration_claims = _DURATION_CLAIM_RE.findall(all_detail_text)
+        if duration_claims:
+            # Check if the duration claim's keywords appear in the original
+            for claim in duration_claims:
+                claim_lower = claim.lower()
+                # Extract the domain keyword (e.g. "paid-search" from
+                # "3+ years of paid-search experience")
+                domain_match = re.search(
+                    r"(?:years?|months?|yrs?)\s+of\s+(.+?)\s+(?:experience|expertise|background)",
+                    claim_lower,
+                )
+                domain_keyword = domain_match.group(1) if domain_match else ""
+                if domain_keyword and domain_keyword not in orig.lower():
+                    issues.append(
+                        f"Duration claim '{claim}' references '{domain_keyword}' "
+                        "which is not found in the original CV."
+                    )
 
         if issues:
             return {
@@ -439,14 +692,31 @@ class CVValidator:
         dates = (item.get("dates") or item.get("date") or "").strip()
 
         if institution and not _present_in(institution, orig):
-            first_word = institution.split()[0] if institution.split() else ""
-            if not first_word or not _present_in(first_word, orig):
+            # Use the same token-overlap approach as employer and skill matching.
+            # Require min(2, len(inst_tokens)) matching tokens to avoid false
+            # passes on common first words like "University" or "National".
+            inst_tokens = _tokens(institution)
+            orig_tokens = _tokens(orig)
+            if not inst_tokens:
                 return {
                     "section": section,
                     "item_index": item_idx,
                     "claim": f"Institution: {institution!r}",
                     "classification": "unsupported",
                     "detail": f"Institution '{institution}' not found in original CV.",
+                }
+            matching = inst_tokens & orig_tokens
+            min_needed = min(2, len(inst_tokens))
+            if len(matching) < min_needed:
+                return {
+                    "section": section,
+                    "item_index": item_idx,
+                    "claim": f"Institution: {institution!r}",
+                    "classification": "unsupported",
+                    "detail": (
+                        f"Institution '{institution}' not found in original CV "
+                        f"(matched {len(matching)}/{len(inst_tokens)} meaningful tokens)."
+                    ),
                 }
 
         if qualification and not _present_in(qualification, orig):
@@ -500,6 +770,16 @@ class CVValidator:
                 "detail": "Empty certification entry — skipped.",
             }
 
+        # Reject placeholder values
+        if _is_placeholder(cert_text):
+            return {
+                "section": section,
+                "item_index": item_idx,
+                "claim": cert_text,
+                "classification": "unsupported",
+                "detail": f"Placeholder value '{cert_text}' — not real candidate data.",
+            }
+
         if _present_in(cert_text, orig):
             return {
                 "section": section,
@@ -548,6 +828,17 @@ class CVValidator:
                 "classification": "supported",
                 "detail": "Empty skill entry — skipped.",
             }
+
+        # Reject placeholder values
+        if _is_placeholder(skill):
+            return {
+                "section": section,
+                "item_index": item_idx,
+                "claim": skill,
+                "classification": "unsupported",
+                "detail": f"Placeholder value '{skill}' detected — not real candidate data.",
+            }
+
         if _present_in(skill, orig):
             return {
                 "section": section,
@@ -556,17 +847,27 @@ class CVValidator:
                 "classification": "supported",
                 "detail": "Skill present in original CV.",
             }
-        # Skills are often abbreviations or slightly different capitalisation;
-        # accept if the first meaningful token matches.
-        first_token = skill.split()[0].lower().rstrip(".,;")
-        if first_token and first_token in orig.lower():
-            return {
-                "section": section,
-                "item_index": item_idx,
-                "claim": skill,
-                "classification": "reasonable_rewording",
-                "detail": f"Skill abbreviation/variant of '{first_token}' found in original.",
-            }
+        # Require at least 2 meaningful tokens to match for a "reasonable rewording"
+        # classification.  The old first-token-only check was too permissive —
+        # "Google Ads" would pass if "Google" appeared anywhere in the original
+        # (even in "Google Analytics"), and "Microsoft Ads" would pass if
+        # "Microsoft" appeared (even in "Microsoft Office").
+        skill_tokens = _tokens(skill)
+        orig_tokens = _tokens(orig)
+        if skill_tokens:
+            matching = skill_tokens & orig_tokens
+            min_needed = min(2, len(skill_tokens))
+            if len(matching) >= min_needed:
+                return {
+                    "section": section,
+                    "item_index": item_idx,
+                    "claim": skill,
+                    "classification": "reasonable_rewording",
+                    "detail": (
+                        f"{len(matching)}/{len(skill_tokens)} skill tokens "
+                        f"found in original CV."
+                    ),
+                }
         return {
             "section": section,
             "item_index": item_idx,
@@ -584,7 +885,16 @@ class CVValidator:
         section: str,
         orig_quant: set[str],
     ) -> list[dict[str, Any]]:
-        """Flag quantified figures in *text* not traceable to original CV."""
+        """Flag quantified figures in *text* not traceable to original CV.
+
+        Figures that appear verbatim in *orig_quant* are silently accepted.
+        Figures absent from the original are classified ``unsupported`` so
+        that both the experience-bullet path and the summary/other path treat
+        them consistently.  The experience-item caller already escalated
+        ``needs_confirmation`` quants to ``unsupported`` at the item level;
+        making the classification uniform here removes that inconsistency and
+        lets all callers handle the result the same way.
+        """
         findings: list[dict[str, Any]] = []
         for figure in _QUANT_RE.findall(text):
             norm = figure.strip().lower()
@@ -592,10 +902,10 @@ class CVValidator:
                 findings.append({
                     "section": section,
                     "claim": f"Quantified figure: {figure!r}",
-                    "classification": "needs_confirmation",
+                    "classification": "unsupported",
                     "detail": (
                         f"The figure '{figure}' does not appear verbatim in the original CV. "
-                        "Please confirm this achievement."
+                        "Remove or confirm this claim before exporting."
                     ),
                 })
         return findings

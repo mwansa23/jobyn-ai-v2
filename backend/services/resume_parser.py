@@ -82,7 +82,11 @@ def extract_text(file_bytes: bytes, content_type: str) -> str:
         content_type: MIME type used to select the appropriate extractor.
 
     Returns:
-        Extracted plain text with whitespace normalized.
+        Extracted plain text with trailing whitespace removed from each
+        line, consecutive blank lines collapsed to a single blank line,
+        and a final trailing newline stripped.  Meaningful line boundaries
+        are **preserved** so that downstream LLM prompts can distinguish
+        job titles, employers, dates, and responsibility bullets.
 
     Raises:
         UnsupportedFileTypeError: If ``content_type`` is not supported.
@@ -107,7 +111,30 @@ def extract_text(file_bytes: bytes, content_type: str) -> str:
             "It may be corrupted or password-protected."
         ) from exc
 
-    normalized = " ".join(text.split())
+    # ── Newline-preserving normalisation ───────────────────────────────
+    # Strip trailing whitespace from each line and collapse runs of more
+    # than one consecutive blank line into a single blank line.  This keeps
+    # section boundaries (blank lines between jobs, between sections) while
+    # removing artefacts like trailing spaces and excessive vertical space.
+    # We do NOT use " ".join(text.split()) because that destroys all line
+    # boundaries and makes it impossible for downstream LLMs to associate
+    # employers with their dates and responsibility bullets.
+    lines = text.splitlines()
+    cleaned: list[str] = []
+    consecutive_blank = 0
+    for line in lines:
+        stripped = line.rstrip()
+        if stripped:
+            cleaned.append(stripped)
+            consecutive_blank = 0
+        else:
+            consecutive_blank += 1
+            if consecutive_blank == 1:
+                # Keep the first blank line in a run; discard subsequent ones.
+                cleaned.append("")
+
+    normalized = "\n".join(cleaned).strip()
+
     if not normalized:
         raise EmptyDocumentError()
 
@@ -115,15 +142,30 @@ def extract_text(file_bytes: bytes, content_type: str) -> str:
 
 
 def _extract_pdf(file_bytes: bytes) -> str:
-    """Extract text from a PDF byte payload using pypdf."""
+    """Extract text from a PDF byte payload using pypdf.
+
+    Each page's text is separated by a form-feed character (``\\f``) so that
+    page boundaries survive the newline-preserving normalisation in
+    :func:`extract_text`.  Empty or whitespace-only pages are logged as
+    warnings rather than silently discarded.
+    """
     from pypdf import PdfReader  # imported lazily so tests can patch
 
     reader = PdfReader(io.BytesIO(file_bytes))
     parts: list[str] = []
-    for page in reader.pages:
+    for page_number, page in enumerate(reader.pages, start=1):
         page_text = page.extract_text() or ""
+        if not page_text.strip():
+            logger.warning(
+                "PDF page %d yielded no extractable text — "
+                "it may be image-only or contain only graphical elements.",
+                page_number,
+            )
         parts.append(page_text)
-    return "\n".join(parts)
+    # Use a form-feed as the inter-page separator so the normaliser preserves
+    # the break without introducing spurious blank lines beyond the existing
+    # page content.
+    return "\f".join(parts)
 
 
 def _extract_docx(file_bytes: bytes) -> str:
