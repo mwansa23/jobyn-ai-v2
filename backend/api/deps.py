@@ -70,12 +70,32 @@ async def get_current_user(
     token: str = Depends(oauth2_scheme),
     auth_service: AuthService = Depends(get_auth_service),
 ) -> User:
-    """Resolve a Supabase or legacy token to the canonical Jobyn user."""
+    """Resolve a Supabase or legacy token to the canonical Jobyn user.
+
+    In ``production`` and ``staging`` environments Supabase is the sole
+    active authentication provider.  Tokens without an ``iss`` claim
+    (legacy HS256 tokens issued by ``POST /auth/login``) are rejected with
+    ``401 Unauthorized`` so that the HS256 fallback cannot be exploited
+    against the production ``SECRET_KEY``.
+
+    In ``development`` and ``test`` environments the legacy path is preserved
+    so that the test suite (which registers accounts via ``POST /auth/register``
+    and obtains HS256 tokens from ``POST /auth/login``) continues to function
+    without requiring a live Supabase project.
+    """
     user: User | None
     if has_issuer_claim(token):
         claims = await verify_supabase_access_token(token)
         user = await auth_service.resolve_supabase_user(claims, token)
     else:
+        environment = get_settings().ENVIRONMENT
+        if environment not in {"development", "test"}:
+            raise InvalidTokenError(
+                detail=(
+                    "Legacy authentication tokens are no longer accepted. "
+                    "Please authenticate through Supabase."
+                )
+            )
         payload = verify_token(token)
         if payload.get("type") != "access":
             raise InvalidTokenError(detail="An access token is required.")
