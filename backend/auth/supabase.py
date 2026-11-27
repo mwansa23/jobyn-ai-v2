@@ -199,3 +199,141 @@ async def verify_supabase_access_token(token: str) -> dict[str, Any]:
     except (KeyError, TypeError, ValueError) as exc:
         raise InvalidTokenError(detail="Invalid Supabase subject.") from exc
     return claims
+
+
+# ---------------------------------------------------------------------------
+# Supabase Auth API client (login / signup proxy)
+# ---------------------------------------------------------------------------
+
+
+def supabase_auth_configured() -> bool:
+    """Return True when the Supabase password-grant proxy can be used.
+
+    Requires both ``SUPABASE_URL`` and ``SUPABASE_PUBLISHABLE_KEY`` to be
+    set.  In development and test environments these are typically unset,
+    in which case the legacy email/password flow remains in place.
+    """
+    settings = get_settings()
+    if not settings.SUPABASE_URL:
+        return False
+    publishable_key = settings.SUPABASE_PUBLISHABLE_KEY
+    if publishable_key is None or not publishable_key.get_secret_value().strip():
+        return False
+    return True
+
+
+class SupabaseAuthRejected(HTTPException):
+    """Raised when the Supabase Auth API rejects credentials."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(status_code=status.HTTP_401_UNAUTHORIZED, detail=detail)
+
+
+class SupabaseEmailAlreadyRegistered(HTTPException):
+    """Raised when the Supabase Auth API reports a duplicate signup."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="An account with this email address already exists.",
+        )
+
+
+async def supabase_password_grant(email: str, password: str) -> dict[str, Any]:
+    """Authenticate email+password against Supabase Auth (password grant).
+
+    Returns:
+        The Supabase token response containing ``access_token``,
+        ``refresh_token`` and ``expires_in``.
+
+    Raises:
+        SupabaseAuthRejected: Invalid credentials (401 from Supabase).
+        SupabaseVerificationUnavailable: Network or configuration failure.
+    """
+    issuer, _ = _project_urls()
+    settings = get_settings()
+    publishable_key = settings.SUPABASE_PUBLISHABLE_KEY
+    if publishable_key is None or not publishable_key.get_secret_value().strip():
+        raise SupabaseVerificationUnavailable()
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                f"{issuer}/token?grant_type=password",
+                headers={"apikey": publishable_key.get_secret_value()},
+                json={"email": email, "password": password},
+            )
+    except httpx.HTTPError as exc:
+        raise SupabaseVerificationUnavailable() from exc
+
+    if response.status_code in {400, 401, 403}:
+        raise SupabaseAuthRejected(detail="Invalid email or password.")
+    if not response.is_success:
+        raise SupabaseVerificationUnavailable()
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise SupabaseVerificationUnavailable() from exc
+    if not isinstance(payload, dict) or not payload.get("access_token"):
+        raise SupabaseVerificationUnavailable()
+    return payload
+
+
+async def supabase_signup(
+    email: str,
+    password: str,
+    full_name: str | None = None,
+) -> dict[str, Any]:
+    """Create a user in Supabase Auth via the signup endpoint.
+
+    Returns:
+        The Supabase signup response.  When email confirmation is disabled
+        the response includes a session (``access_token``); otherwise it
+        contains only the pending ``user`` object.
+
+    Raises:
+        SupabaseEmailAlreadyRegistered: The email already exists (422).
+        SupabaseAuthRejected: Password policy rejection (400).
+        SupabaseVerificationUnavailable: Network or configuration failure.
+    """
+    issuer, _ = _project_urls()
+    settings = get_settings()
+    publishable_key = settings.SUPABASE_PUBLISHABLE_KEY
+    if publishable_key is None or not publishable_key.get_secret_value().strip():
+        raise SupabaseVerificationUnavailable()
+
+    body: dict[str, Any] = {"email": email, "password": password}
+    if full_name:
+        body["data"] = {"full_name": full_name}
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                f"{issuer}/signup",
+                headers={"apikey": publishable_key.get_secret_value()},
+                json=body,
+            )
+    except httpx.HTTPError as exc:
+        raise SupabaseVerificationUnavailable() from exc
+
+    if response.status_code == 422:
+        raise SupabaseEmailAlreadyRegistered()
+    if response.status_code == 400:
+        try:
+            message = response.json().get("msg") or response.json().get("error")
+        except ValueError:
+            message = None
+        raise SupabaseAuthRejected(
+            detail=message or "Password does not meet the security policy."
+        )
+    if not response.is_success:
+        raise SupabaseVerificationUnavailable()
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise SupabaseVerificationUnavailable() from exc
+    if not isinstance(payload, dict):
+        raise SupabaseVerificationUnavailable()
+    return payload

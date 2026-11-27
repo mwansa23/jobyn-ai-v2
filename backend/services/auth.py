@@ -285,6 +285,54 @@ class AuthService(BaseService[UserRepository]):
         await self.user_repository.session.refresh(user)
         return user
 
+    async def link_or_provision_for_signup(
+        self,
+        email: str,
+        full_name: str | None,
+        supabase_user_id: UUID,
+        is_verified: bool,
+    ) -> User:
+        """Create or link the Jobyn account for a Supabase signup.
+
+        If an unlinked account with the same email exists, it is linked.
+        If no account exists, a passwordless one is provisioned.  All other
+        combinations raise :class:`SupabaseIdentityConflictError`.
+        """
+        normalized = _normalize_email(email)
+        candidates = await self.user_repository.get_email_link_candidates(normalized)
+        if len(candidates) > 1:
+            raise SupabaseIdentityConflictError()
+        if candidates:
+            user = candidates[0]
+            if user.deleted_at is not None or (
+                user.supabase_user_id is not None and user.supabase_user_id != supabase_user_id
+            ):
+                raise SupabaseIdentityConflictError()
+            linked = await self.user_repository.link_supabase_identity(
+                user.id, supabase_user_id
+            )
+            if not linked:
+                await self.rollback()
+                existing = await self.user_repository.get_by_supabase_user_id(supabase_user_id)
+                if existing is not None:
+                    return existing
+                raise SupabaseIdentityConflictError()
+            user.supabase_user_id = supabase_user_id
+        else:
+            await self.rollback()
+            user = await self.user_repository.create(
+                email=normalized,
+                hashed_password=None,
+                full_name=full_name,
+                supabase_user_id=supabase_user_id,
+                is_active=True,
+                is_verified=is_verified,
+                role="user",
+            )
+        await self.commit()
+        await self.user_repository.session.refresh(user)
+        return user
+
     def create_access_token_response(
         self,
         user: User,

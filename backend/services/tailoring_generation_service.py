@@ -198,10 +198,17 @@ class TailoringGenerationService(BaseService[TailoredCVRepository]):
             logger.exception("CV rewrite failed for user %s", user_id)
             raise TailoringGenerationError(f"CV rewriting failed: {exc}") from exc
 
+        # ── Completeness validation ───────────────────────────────────────────
+        # Runs even when the rewriter is mocked (e.g. in tests) so that
+        # generation_notes are always honest about missing sections.
+        CVRewriterService._validate_and_correct_notes(rewritten, cv_text)
+
+        # _missing_sections is an internal metadata field used only here.
+        # Strip it from the content dict before persistence so it does not
+        # leak through TailoredCVRead or document export responses.
+        rewritten.pop("_missing_sections", None)
+
         # ── Factual validation (deterministic, no LLM call) ──────────────────
-        # cv_text was resolved from cv_doc above and is the correct source
-        # document for this generation, so pass it directly (avoids a redundant
-        # DB round-trip through _resolve_original_cv_text).
         self._run_validation(rewritten, cv_text)
 
         # Determine version number

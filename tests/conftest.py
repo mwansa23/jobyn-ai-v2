@@ -12,6 +12,12 @@ _TEST_DIR = tempfile.mkdtemp(prefix="jobyn_test_")
 
 os.environ["ENVIRONMENT"] = "test"
 
+# Neutralize Supabase Auth so tests use the legacy email/password flow by
+# default.  Tests that exercise the Supabase login proxy monkeypatch the
+# settings instance directly (see tests/test_auth_proxy.py).
+os.environ["SUPABASE_URL"] = ""
+os.environ["SUPABASE_PUBLISHABLE_KEY"] = ""
+
 os.environ["DATABASE_URL"] = (
     f"sqlite+aiosqlite:///{_TEST_DIR}/test.db"
 )

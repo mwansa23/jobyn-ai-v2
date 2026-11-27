@@ -338,7 +338,47 @@ async function restoreTailoringSession() {
   }
 
   if (tailoredCV) {
-    _applyTailoredCV(tailoredCV);
+    // Only display the restored tailored CV if it was generated from the
+    // current analysis — i.e. the analysis still matches both the active CV
+    // and the active JD.  If the analysis is stale (documents changed since
+    // the CV was generated), show a soft notice instead so the user knows
+    // they need to run a fresh analysis and generation.  The old tailored CV
+    // is NOT deleted — it remains accessible via the history panel.
+    const tailoredMatchesCurrent = (
+      tailoredCV.analysis_id &&
+      analysis &&
+      tailoredCV.analysis_id === analysis.id &&
+      analysisMatchesDocuments
+    );
+    if (tailoredMatchesCurrent) {
+      _applyTailoredCV(tailoredCV);
+    } else {
+      // Surface the history section so the user knows a previous CV exists,
+      // but do NOT render it as the current/active tailored result.
+      document.getElementById('tailor-cv-preview-section')?.classList.remove('hide');
+      const badge = document.getElementById('tailor-cv-version-badge');
+      if (badge) badge.textContent = '';
+      const statusBadge = document.getElementById('tailor-cv-status-badge');
+      if (statusBadge) {
+        statusBadge.textContent = 'From previous session';
+        statusBadge.className = 'cv-status-pending';
+      }
+      const summary = document.getElementById('tailor-cv-change-summary');
+      if (summary) {
+        summary.classList.remove('hide');
+        summary.textContent =
+          'A tailored CV from a previous session exists but was generated for different documents. ' +
+          'Run a new analysis and generate a fresh CV for your current CV and job description. ' +
+          'Your previous CV is still accessible in the version history.';
+      }
+      // Clear the preview so the old CV is not visible as if it were current.
+      const previewEl = document.getElementById('tailor-cv-preview');
+      if (previewEl) previewEl.innerHTML = '';
+      // Keep tailoredCVId in memory so the history panel can still show it.
+      tailoredCVId = tailoredCV.id;
+      tailoredCVVersion = tailoredCV.version_number;
+      tailoredCVContent = null; // ← null signals "not current"
+    }
   } else if (tailoredCVResult.status !== 404) {
     errors.push('tailored CV');
   }
@@ -725,6 +765,27 @@ function _invalidateTailoringAnalysis() {
   tailoringAnalysisReady = false;
   tailoringAnalysisData = null;
   document.getElementById('tailor-generate-cv-bar')?.classList.add('hide');
+  // If the displayed tailored CV was generated from the now-stale analysis,
+  // clear the preview so the user is not misled into thinking the old result
+  // applies to their new documents.  tailoredCVId is preserved so the history
+  // panel can still access previous versions.
+  if (tailoredCVContent !== null) {
+    tailoredCVContent = null;
+    const previewEl = document.getElementById('tailor-cv-preview');
+    if (previewEl) previewEl.innerHTML = '';
+    const summary = document.getElementById('tailor-cv-change-summary');
+    if (summary) {
+      summary.classList.remove('hide');
+      summary.textContent =
+        'Your CV or job description has changed. ' +
+        'Run a new analysis and generate a fresh tailored CV.';
+    }
+    const statusBadge = document.getElementById('tailor-cv-status-badge');
+    if (statusBadge) {
+      statusBadge.textContent = 'Outdated';
+      statusBadge.className = 'cv-status-pending';
+    }
+  }
 }
 
 async function runTailoringAnalysis() {

@@ -242,3 +242,6 @@ _*.txt
 migration_output.txt
 Activate.ps1)
 openapi-live.json
+
+# Personal CV PDFs and other sensitive test fixture files
+tests/*.pdf

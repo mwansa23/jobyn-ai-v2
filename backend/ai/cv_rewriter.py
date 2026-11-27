@@ -84,7 +84,7 @@ class CVRewriterService:
         prompt = self._build_prompt(cv_text, jd_analysis, match_result, recommendations)
 
         try:
-            result = await generate_json(prompt, max_tokens=8192)
+            result = await generate_json(prompt, max_tokens=16384)
         except LLMError as exc:
             logger.exception(
                 "CVRewriterService.rewrite failed after LLMError "
@@ -94,7 +94,9 @@ class CVRewriterService:
             )
             raise CVRewriterError("Failed to rewrite the CV.") from exc
 
-        return self._normalize_response(result)
+        normalized = self._normalize_response(result)
+
+        return normalized
 
     @staticmethod
     def _build_prompt(
@@ -146,6 +148,17 @@ class CVRewriterService:
             "in the recommendations).\n"
             "- The rewritten CV must be COMPLETE — include all sections from "
             "the original CV, rewritten and reorganised as needed.\n"
+            "- TOKEN BUDGET WARNING: This response may be long. If you are "
+            "approaching the token limit, CONDENSE bullet points (use 1–2 lines "
+            "per bullet) rather than omitting entire sections. A short section is "
+            "far better than a missing section. NEVER stop generating before "
+            "certifications, education, skills, and languages are output.\n"
+            "- SECTION COMPLETENESS REQUIREMENT: Before closing the JSON, verify "
+            "that you have included a section for every distinct heading visible "
+            "in the original CV text, including certifications/training, "
+            "languages, volunteer work, awards, interests, and any other sections "
+            "present. If a section heading appears in the source but not in your "
+            "output, add it now — even with condensed content.\n"
             "- ``content`` is for single-paragraph sections (summary). "
             "``items`` is for list-based sections (experience, skills, "
             "education, certifications). Use one or the other per section.\n"
@@ -154,8 +167,11 @@ class CVRewriterService:
             "and ``details`` (list of responsibility bullet strings).\n"
             "- For education items, each dict must have: ``qualification``, "
             "``institution``, and ``dates``.\n"
-            "- ``generation_notes`` should briefly explain what was changed "
-            "and what was preserved.\n\n"
+            "- ``generation_notes`` must accurately list which sections were "
+            "preserved, which were rewritten, and — critically — which sections "
+            "from the original CV ARE MISSING from your output. Do not claim a "
+            "section was preserved if it does not appear as a section entry in "
+            "your ``sections`` array.\n\n"
             "Section types:\n"
             "- 'contact': Name and contact details (preserve verbatim)\n"
             "- 'summary': Professional summary/profile (rewrite for target role)\n"
@@ -174,6 +190,159 @@ class CVRewriterService:
             "Original CV text:\n"
             f"{cv_text.strip()}"
         )
+
+    @staticmethod
+    def _detect_source_sections(cv_text: str) -> list[str]:
+        """Return a list of probable section headings found in the original CV.
+
+        A line qualifies as a heading when it is:
+        - 60 characters or fewer, with no inline punctuation (@, |, commas,
+          parentheses) that indicates a data/body line
+        - ALL-CAPS (any word count), ends with ':', or is a multi-word
+          Title-Case line containing a known section keyword.
+
+        Single-word Title-Case lines (names, job titles) are excluded unless
+        they are entirely upper-case.
+        """
+        # Known section-heading keywords for multi-word title-case matching.
+        _SECTION_KEYWORDS = frozenset({
+            "experience", "education", "employment", "career", "history",
+            "skills", "skill", "summary", "profile", "objective",
+            "certification", "certifications", "certificate", "certificates",
+            "training", "courses", "course", "qualification", "qualifications",
+            "language", "languages",
+            "volunteer", "volunteering", "projects", "project",
+            "awards", "award", "interests", "interest",
+            "reference", "references", "achievements", "achievement",
+            "professional", "relevant", "additional",
+        })
+
+        headings: list[str] = []
+        for line in cv_text.splitlines():
+            stripped = line.strip()
+            if not stripped or len(stripped) > 60:
+                continue
+            if stripped[0] in "-•*":
+                continue
+            if stripped[0].isdigit():
+                continue
+            if any(ch in stripped for ch in "@|,()"):
+                continue
+            stripped_no_colon = stripped.rstrip(":").strip()
+            words = stripped_no_colon.split()
+            if not words:
+                continue
+
+            # Path 1: ALL-CAPS line with only alpha chars (e.g. "EDUCATION")
+            core = stripped_no_colon.replace(" ", "")
+            if core.isupper() and core.replace("-", "").isalpha():
+                headings.append(stripped_no_colon)
+                continue
+
+            # Path 2: ends with colon, at least two words
+            if stripped.endswith(":") and len(words) >= 2:
+                headings.append(stripped_no_colon)
+                continue
+
+            # Path 3: multi-word Title-Case containing a known section keyword
+            if (
+                len(words) >= 2
+                and all(w[0].isupper() for w in words if w)
+                and not stripped[0].islower()
+                and any(w.lower() in _SECTION_KEYWORDS for w in words)
+            ):
+                headings.append(stripped_no_colon)
+                continue
+
+        return headings
+
+    @staticmethod
+    def _validate_and_correct_notes(
+        normalized: dict[str, Any],
+        cv_text: str,
+    ) -> None:
+        """Rewrite ``generation_notes`` to honestly reflect what is present.
+
+        Compares the section types and headings in the output against probable
+        source sections.  Appends a WARNING prefix if sections appear to be
+        missing, so downstream callers and the UI can surface the issue rather
+        than silently accepting an incomplete CV.
+
+        Modifies *normalized* in-place.
+        """
+        output_sections = normalized.get("sections", [])
+        output_headings = {
+            s.get("heading", "").strip().lower()
+            for s in output_sections
+            if isinstance(s, dict)
+        }
+        output_types = {
+            s.get("type", "")
+            for s in output_sections
+            if isinstance(s, dict)
+        }
+
+        # Detect probable source headings from the raw CV text.
+        source_headings_raw = CVRewriterService._detect_source_sections(cv_text)
+
+        # Map well-known heading keywords to expected section types.
+        _HEADING_TO_TYPE = {
+            "certification": "certifications",
+            "certificate": "certifications",
+            "training": "certifications",
+            "courses": "certifications",
+            "language": "other",
+            "volunteer": "other",
+            "award": "other",
+            "interest": "other",
+            "project": "projects",
+            "education": "education",
+            "qualification": "education",
+        }
+
+        missing: list[str] = []
+        for heading in source_headings_raw:
+            heading_lower = heading.lower()
+            # Check by exact heading match first.
+            if heading_lower in output_headings:
+                continue
+            # Check whether any output section heading contains the source heading.
+            if any(heading_lower in oh for oh in output_headings):
+                continue
+            # Check by expected type keyword.
+            matched_type = next(
+                (t for kw, t in _HEADING_TO_TYPE.items() if kw in heading_lower),
+                None,
+            )
+            if matched_type and matched_type in output_types:
+                continue
+            # This source heading has no match in the output.
+            missing.append(heading)
+
+        existing_notes = normalized.get("generation_notes", "") or ""
+
+        if missing:
+            warning = (
+                f"WARNING: The following sections from the source CV appear to be "
+                f"absent from the generated output (possible truncation): "
+                f"{', '.join(missing)}. "
+                f"The CV may be incomplete."
+            )
+            logger.warning(
+                "CVRewriterService: possible truncated output — missing sections: %s",
+                missing,
+            )
+            normalized["generation_notes"] = warning + (
+                f" Original notes: {existing_notes}" if existing_notes else ""
+            )
+            normalized["_missing_sections"] = missing
+        else:
+            # Scrub any LLM self-report that claims sections were preserved
+            # but doesn't match reality — replace with a verified note.
+            normalized["generation_notes"] = (
+                existing_notes
+                or "All detected source sections are present in the output."
+            )
 
     @staticmethod
     def _normalize_response(result: dict[str, Any]) -> dict[str, Any]:

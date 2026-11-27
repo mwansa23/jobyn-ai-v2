@@ -12,6 +12,14 @@ from fastapi.exceptions import RequestValidationError
 from pydantic import ValidationError
 
 from backend.api.deps import get_auth_service, get_current_user
+from backend.auth.supabase import (
+    SupabaseEmailAlreadyRegistered,
+    SupabaseAuthRejected,
+    SupabaseVerificationUnavailable,
+    supabase_auth_configured,
+    supabase_password_grant,
+    supabase_signup,
+)
 from backend.models.user import User
 from backend.schemas.auth import TokenResponse, UserLogin
 from backend.schemas.user import UserCreate, UserRead
@@ -33,7 +41,47 @@ async def register(
     user_data: UserCreate,
     auth_service: AuthService = Depends(get_auth_service),
 ) -> UserRead:
-    """Create a new user account."""
+    """Create a new user account.
+
+    When Supabase Auth is configured (SUPABASE_URL + SUPABASE_PUBLISHABLE_KEY),
+    the account is created in Supabase via the signup proxy and the Jobyn
+    record is linked or provisioned without a local password.  Otherwise the
+    legacy email/password flow is used.
+    """
+    if supabase_auth_configured():
+        from uuid import UUID as _UUID
+
+        try:
+            signup = await supabase_signup(
+                str(user_data.email),
+                user_data.password,
+                user_data.full_name,
+            )
+        except SupabaseEmailAlreadyRegistered:
+            raise
+        except SupabaseAuthRejected as exc:
+            from fastapi import HTTPException as _HTTPException
+
+            raise _HTTPException(status_code=exc.status_code, detail=exc.detail)
+
+        supabase_user = signup.get("user") or {}
+        raw_id = supabase_user.get("id")
+        try:
+            supabase_user_id = _UUID(raw_id)
+        except (TypeError, ValueError, AttributeError):
+            raise SupabaseVerificationUnavailable()
+
+        verified = bool(
+            signup.get("access_token")
+            or supabase_user.get("email_confirmed_at")
+        )
+        user = await auth_service.link_or_provision_for_signup(
+            str(user_data.email),
+            user_data.full_name,
+            supabase_user_id,
+            verified,
+        )
+        return UserRead.model_validate(user)
 
     return await auth_service.register_user(user_data)
 
@@ -78,6 +126,17 @@ async def login(
         except ValidationError as exc:
             raise RequestValidationError(exc.errors()) from exc
 
+    # — Supabase password-grant proxy (production/staging) —
+    if supabase_auth_configured():
+        grant = await supabase_password_grant(str(data.email), data.password)
+        expires_in = grant.get("expires_in")
+        return TokenResponse(
+            access_token=grant["access_token"],
+            token_type="bearer",
+            expires_in=int(expires_in) if isinstance(expires_in, (int, float)) else 3600,
+        )
+
+    # — Legacy email/password flow (development/test) —
     user = await auth_service.authenticate_user(
         email=str(data.email),
         password=data.password,

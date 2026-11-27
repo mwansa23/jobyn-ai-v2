@@ -60,7 +60,7 @@ def rsa_keys():
 def mocked_supabase_jwks(monkeypatch, rsa_keys):
     """Configure SUPABASE_URL and mock the JWKS and /user endpoints."""
     import httpx
-    _, public_jwk = rsa_keys
+    private_key, public_jwk = rsa_keys
     settings = get_settings()
     monkeypatch.setattr(settings, "SUPABASE_URL", _PROJECT_URL)
     monkeypatch.setattr(settings, "SUPABASE_JWT_SECRET", None)
@@ -70,10 +70,35 @@ def mocked_supabase_jwks(monkeypatch, rsa_keys):
     supabase_auth._JWKS_CACHE.clear()
 
     def handle(request: httpx.Request) -> httpx.Response:
-        if "jwks.json" in str(request.url):
+        url = str(request.url)
+        if "jwks.json" in url:
             return httpx.Response(200, json={"keys": [public_jwk]})
-        # /user endpoint
-        access_token = request.headers["authorization"].removeprefix("Bearer ")
+        if "/signup" in url:
+            # Mock signup: auto-create an identity and return a session.
+            import json as _json, uuid as _uuid
+            try:
+                body = _json.loads(request.content)
+            except Exception:
+                body = {}
+            email = body.get("email", f"mock-{_uuid.uuid4().hex[:8]}@example.com")
+            sub = str(_uuid.uuid4())
+            claims = {
+                "sub": sub, "iss": _ISSUER, "aud": "authenticated",
+                "iat": int(time.time()), "exp": int(time.time()) + 3600,
+                "email": email, "role": "authenticated",
+            }
+            token = jwt.encode(claims, private_key, algorithm="RS256",
+                               headers={"kid": _KID})
+            return httpx.Response(200, json={
+                "access_token": token, "token_type": "bearer", "expires_in": 3600,
+                "user": {"id": sub, "email": email,
+                         "email_confirmed_at": "2026-01-01T00:00:00Z"},
+            })
+        # /user endpoint — expects Bearer token
+        auth_header = request.headers.get("authorization", "")
+        if not auth_header.startswith("Bearer "):
+            return httpx.Response(401, json={"message": "Missing token"})
+        access_token = auth_header.removeprefix("Bearer ")
         claims = jwt.decode(
             access_token,
             options={"verify_signature": False, "verify_exp": False, "verify_aud": False},
@@ -348,10 +373,15 @@ def test_legacy_user_can_link_via_supabase_on_next_login(
     private_key, _ = rsa_keys
     email = f"link-{uuid.uuid4().hex[:8]}@example.com"
 
-    # Register via legacy path (email+password)
+    # Register via the legacy path only (email+password, no Supabase identity).
+    # Temporarily suppress Supabase so the register endpoint uses the legacy
+    # flow and creates a plain Jobyn account without a supabase_user_id.
+    monkeypatch.setattr(get_settings(), "SUPABASE_URL", None)
     r_reg = client.post(REGISTER_URL, json={"email": email, "password": "Link123!", "full_name": "Link Test"})
-    assert r_reg.status_code == 201
+    assert r_reg.status_code == 201, r_reg.text
     legacy_user_id = r_reg.json()["id"]
+    # Restore Supabase so the remaining requests (Supabase login) work.
+    monkeypatch.setattr(get_settings(), "SUPABASE_URL", _PROJECT_URL)
 
     # Switch to production gate — legacy token now blocked
     monkeypatch.setattr(get_settings(), "ENVIRONMENT", "production")
