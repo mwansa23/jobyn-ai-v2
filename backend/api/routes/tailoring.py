@@ -456,11 +456,19 @@ async def run_analysis(
 ) -> TailoringAnalysisRead:
     """Run the full analysis pipeline: JD analysis → CV-to-JD matching → tailoring recommendations.
 
-    Uses the user's latest CV and JD documents. All three stages are persisted
-    in a single analysis record.
+    Uses the user's latest CV and JD documents, or the specific document IDs
+    supplied in the request payload.  Passing explicit IDs prevents race
+    conditions and stale-document bugs when two JD documents share the same
+    ``created_at`` timestamp.
     """
+    cv_document_id  = payload.cv_document_id  if payload else None
+    jd_document_id  = payload.jd_document_id  if payload else None
     try:
-        analysis = await service.run_analysis(current_user.id)
+        analysis = await service.run_analysis(
+            current_user.id,
+            cv_document_id=cv_document_id,
+            jd_document_id=jd_document_id,
+        )
     except TailoringAnalysisError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,

@@ -289,6 +289,8 @@ const COPILOT_CONTEXT_LIMIT = 2000; // server-side max for additional_context
 let tailoringCVReady = false;
 let tailoringJDReady = false;
 let tailoringJDText  = '';   // full, untruncated JD text
+let tailoringJDDocumentId = null;  // document ID of the most recently saved JD
+let tailoringCVDocumentId = null;  // document ID of the most recently uploaded CV
 let tailoringAnalysisReady = false;
 let tailoringAnalysisData = null;
 
@@ -307,6 +309,7 @@ async function restoreTailoringSession() {
 
   if (cv) {
     _showTailorCVStatus(cv);
+    tailoringCVDocumentId = cv.id || null;
     tailoringCVReady = cv.extraction_status === 'succeeded' &&
       Boolean((cv.extracted_text || cv.pasted_text || '').trim());
   } else if (cvResult.status !== 404) {
@@ -316,6 +319,7 @@ async function restoreTailoringSession() {
   if (jd) {
     _showTailorJDStatus(jd);
     tailoringJDText = jd.extracted_text || jd.pasted_text || '';
+    tailoringJDDocumentId = jd.id || null;
     tailoringJDReady = jd.extraction_status === 'succeeded' && Boolean(tailoringJDText.trim());
   } else if (jdResult.status !== 404) {
     errors.push('job description');
@@ -546,6 +550,7 @@ async function _handleJDMessage(text, typingId) {
 
   if (r.ok) {
     tailoringJDText  = text;
+    tailoringJDDocumentId = r.data?.id || null;
     tailoringJDReady = true;
     _invalidateTailoringAnalysis();
     const words = text.trim().split(/\s+/).filter(Boolean).length;
@@ -640,7 +645,12 @@ async function _runAnalysisChat(userMessage) {
   tailoringAnalysisReady = false;
   document.getElementById('tailor-generate-cv-bar')?.classList.add('hide');
   _chatAppend('jobyn', spin() + ' Analysing your CV against the job description…');
-  const r = await api('/api/v1/tailoring/analyze', 'POST', {});
+  // Pass explicit document IDs so the backend uses the exact JD and CV the
+  // user just submitted, not whatever created_at-ordering returns.
+  const analyzePayload = {};
+  if (tailoringJDDocumentId) analyzePayload.jd_document_id = tailoringJDDocumentId;
+  if (tailoringCVDocumentId) analyzePayload.cv_document_id = tailoringCVDocumentId;
+  const r = await api('/api/v1/tailoring/analyze', 'POST', analyzePayload);
   _chatRemove('chat-typing-' + Date.now()); // remove the typing indicator if present
   // Remove the last "Analysing…" message
   const thread = document.getElementById('tailor-chat-thread');
@@ -817,6 +827,7 @@ async function uploadTailoringCV() {
     if (r.ok) {
       showMsg(msg, 'ok', 'CV uploaded and text extracted successfully.');
       _showTailorCVStatus(data);
+      tailoringCVDocumentId = data.id || null;
       tailoringCVReady = true;
       _invalidateTailoringAnalysis();
       _checkTailoringProceed();
@@ -851,6 +862,7 @@ async function uploadTailoringJD() {
       showMsg(msg, 'ok', 'Job description uploaded and extracted.');
       _showTailorJDStatus(data);
       tailoringJDText  = data.extracted_text || '';
+      tailoringJDDocumentId = data.id || null;
       tailoringJDReady = true;
       _invalidateTailoringAnalysis();
       _checkTailoringProceed();

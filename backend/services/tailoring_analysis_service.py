@@ -49,30 +49,58 @@ class TailoringAnalysisService(BaseService[TailoringAnalysisRepository]):
         self._cv_jd_matcher = cv_jd_matcher or CVJDMatcherService()
         self._tailoring_advisor = tailoring_advisor or TailoringAdvisorService()
 
-    async def run_analysis(self, user_id: uuid.UUID) -> TailoringAnalysis:
+    async def run_analysis(
+        self,
+        user_id: uuid.UUID,
+        *,
+        cv_document_id: uuid.UUID | None = None,
+        jd_document_id: uuid.UUID | None = None,
+    ) -> TailoringAnalysis:
         """Run the full analysis pipeline for a user.
 
-        Loads the user's latest CV and JD documents, then executes:
-        1. JD analysis (structured extraction)
-        2. CV-to-JD matching (evidence-based comparison)
-        3. Tailoring recommendations (structured output for Phase 3)
-
-        All three stages are persisted in a single :class:`TailoringAnalysis`
-        record. If a stage fails, the error is recorded and earlier results
-        are still persisted.
+        Loads the user's CV and JD documents — using the explicitly supplied
+        document IDs when given, otherwise falling back to the most recently
+        created document of each type.  Explicit IDs prevent stale-document
+        substitution caused by timestamp ties or rapid sequential uploads.
 
         Args:
             user_id: The authenticated user's UUID.
+            cv_document_id: If provided, use this specific CV document instead
+                of the latest one.
+            jd_document_id: If provided, use this specific JD document instead
+                of the latest one.  The frontend should always supply this
+                value after a successful paste or upload so the analysis is
+                guaranteed to use the exact JD the user just submitted.
 
         Returns:
             The persisted :class:`TailoringAnalysis` record.
 
         Raises:
-            TailoringAnalysisError: If no CV or JD document exists.
+            TailoringAnalysisError: If no CV or JD document exists, or the
+                supplied document ID does not belong to this user.
         """
-        # Step 0 — load documents.
-        cv_doc = await self.document_service.get_latest_cv(user_id)
-        jd_doc = await self.document_service.get_latest_job_description(user_id)
+        # Step 0 — load documents (prefer explicit IDs over latest).
+        if cv_document_id is not None:
+            cv_doc = await self.document_service.get_document_for_user(
+                cv_document_id, user_id
+            )
+            if cv_doc is None:
+                raise TailoringAnalysisError(
+                    "The specified CV document was not found or does not belong to you."
+                )
+        else:
+            cv_doc = await self.document_service.get_latest_cv(user_id)
+
+        if jd_document_id is not None:
+            jd_doc = await self.document_service.get_document_for_user(
+                jd_document_id, user_id
+            )
+            if jd_doc is None:
+                raise TailoringAnalysisError(
+                    "The specified job description document was not found or does not belong to you."
+                )
+        else:
+            jd_doc = await self.document_service.get_latest_job_description(user_id)
 
         if cv_doc is None:
             raise TailoringAnalysisError(
